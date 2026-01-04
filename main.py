@@ -5,26 +5,58 @@ import logging
 import sys
 from logging.handlers import TimedRotatingFileHandler
 import os
+from typing import Any
 
 from modules.config import load_config
 from modules.radarr_pyarr import RadarrProcessor
 from modules.rss import run_rss_sync
 
 
+def _cfg_get(cfg: Any, *path, default=None):
+    """
+    Safe accessor for config values that works whether `cfg` is a dict or an object
+    with attributes. Example: _cfg_get(config, "radarr", "url", default="...").
+    """
+    cur = cfg
+    for p in path:
+        if cur is None:
+            return default
+        # dict-like
+        try:
+            if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+                continue
+        except Exception:
+            pass
+        # attribute-like
+        try:
+            if hasattr(cur, p):
+                cur = getattr(cur, p)
+                continue
+        except Exception:
+            pass
+        # fallback: try key access if possible
+        try:
+            cur = cur[p]
+        except Exception:
+            return default
+    return cur if cur is not None else default
+
+
 def setup_logging(config):
-    log_path = os.path.join(config.config_folder, "script.log")
+    log_path = os.path.join(_cfg_get(config, "config_folder", default="config"), "script.log")
 
     # Remove default handlers to prevent duplication on re-run
     root = logging.getLogger()
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
-    base_level = logging.DEBUG if getattr(config, "debug_logging", False) else logging.INFO
+    base_level = logging.DEBUG if _cfg_get(config, "debug_logging", default=False) else logging.INFO
     log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 
     file_handler = TimedRotatingFileHandler(
         log_path, when="midnight", interval=1,
-        backupCount=getattr(config, "log_retention_days", 7), encoding="utf-8"
+        backupCount=_cfg_get(config, "log_retention_days", default=7), encoding="utf-8"
     )
     file_handler.setFormatter(log_formatter)
     file_handler.setLevel(base_level)
@@ -35,7 +67,7 @@ def setup_logging(config):
 
     logging.basicConfig(level=base_level, handlers=[file_handler, stream_handler], force=True)
 
-    if getattr(config, "debug_logging", False):
+    if _cfg_get(config, "debug_logging", default=False):
         # Make your modules and helpful libraries verbose
         logging.getLogger("modules").setLevel(logging.DEBUG)
         logging.getLogger("modules.rss").setLevel(logging.DEBUG)
@@ -53,9 +85,10 @@ def setup_logging(config):
 
     logging.getLogger(__name__).info(
         "Debug mode: %s, Debug logging: %s",
-        getattr(config, "debug_mode", False),
-        getattr(config, "debug_logging", False)
+        _cfg_get(config, "debug_mode", default=False),
+        _cfg_get(config, "debug_logging", default=False)
     )
+
 
 def main():
     # 1. Load Config
@@ -77,35 +110,53 @@ def main():
     logging.info("*******************************************************************************************")
     logging.info("🚀 Loaded configuration from config.yaml")
 
+    # 2. Init Engine (robustly read radarr settings from config)
+    radarr_url = _cfg_get(config, "radarr", "url", default=_cfg_get(config, "radarr_url"))
+    radarr_api_key = _cfg_get(config, "radarr", "api_key", default=_cfg_get(config, "radarr_api_key"))
+    quality_profile = _cfg_get(config, "radarr", "quality_profile", default=_cfg_get(config, "quality_profile", default=1))
+    quality_threshold = _cfg_get(config, "radarr", "quality_threshold", default=_cfg_get(config, "quality_threshold", default=0))
+    root_folder = _cfg_get(config, "radarr", "root_folder", default=_cfg_get(config, "root_folder", default=""))
 
-    # 2. Init Engine
-    processor = RadarrProcessor(
-        url=config.radarr_url,
-        api_key=config.radarr_api_key,
-        quality_profile=config.radarr.quality_profile,
-        threshold=config.radarr.quality_threshold,
-        root_folder=config.radarr.root_folder
-    )
+    try:
+        processor = RadarrProcessor(
+            url=radarr_url,
+            api_key=radarr_api_key,
+            quality_profile=int(quality_profile),
+            threshold=int(quality_threshold),
+            root_folder=root_folder
+        )
+    except Exception as e:
+        logging.exception("Failed to initialize RadarrProcessor: %s", e)
+        return
 
     # 3. Main Loop
+    # Determine execution interval (minutes) with sensible fallbacks
+    execution_interval = _cfg_get(config, "execution_interval",
+                                  default=_cfg_get(config, "sleep_minutes",
+                                                   default=_cfg_get(config, "poll_interval_minutes", default=30)))
+    try:
+        execution_interval = float(execution_interval)
+    except Exception:
+        execution_interval = 30.0
+
     while True:
         try:
             start_time = time.time()
             added, exists, excluded = run_rss_sync(config, processor)
 
             duration = round(time.time() - start_time, 2)
-            logging.info(f"📊 Report: Pushed={added} | Exists/Skipped={exists} | Time={duration}s")
+            logging.info("📊 Report: Pushed=%s | Exists/Skipped=%s | Time=%ss", added, exists, duration)
 
         except KeyboardInterrupt:
             logging.info("🛑 Stop signal received. Exiting.")
             break
         except Exception as e:
-            logging.error(f"❌ Critical Loop Error: {e}")
+            logging.error("❌ Critical Loop Error: %s", e, exc_info=True)
 
         # Sleep
-        logging.info(f"💤 Sleeping for {config.execution_interval} minutes...")
+        logging.info("💤 Sleeping for %s minutes...", execution_interval)
         try:
-            time.sleep(config.execution_interval * 60)
+            time.sleep(execution_interval * 60)
         except KeyboardInterrupt:
             logging.info("🛑 Stop signal received. Exiting.")
             break
