@@ -13,7 +13,7 @@ match_patterns:
   # - ".*(?=.*1080p).*?(?=.*(?:BluRay|WEBRip)).*?(?=.*(?:x|h)?26[45]).*?(?=.*(?=.*edge2020))"
   # - ".*(?=.*1080p).*?(?=.*(?:BluRay|WEBRip)).*?(?=.*(?=.*YTS.MX))"
   # - ".*(?=.*1080p)(?=.*(?:BluRay|WEBRip|HDRip|WEB-DL)).*?(?=.*(?:x265|HEVC|x264|h264|h265)).*GalaxyRG265"
-  # - "^(?=.*\\b1080p\\b)(?=.*\\b(?:WEBRip|BluRay)\\b)(?=.*\\b-LAMA\\b).*"
+  - "^(?=.*\\b1080p\\b)(?=.*\\b(?:WEBRip|BluRay)\\b)(?=.*\\b-LAMA\\b).*"
   # - "^(?=.*\\b1080p\\b)(?=.*\\b(?:WEBRip|BluRay)\\b)(?=.*\\b(?:x264|x265|h264|h265|HEVC)\\b)(?=.*\\b-PSA\\b).*"
   - "^(?=.*\\b1080p\\b)(?=.*\\b(?:WEB[- ]?DL|WEBRip|BluRay)\\b)(?=.*\\b(?:x265|H\\.265|HEVC)\\b)(?=.*\\b(?:OldT|HHWEB|NTG|HDSWEB|Kitsune|LAMA|PSA)\\b).*"
 
@@ -53,5 +53,9 @@ rss_feeds:
 log_retention_days: 7  # default to 7 days
 
 radarr:
-  quality_profile: 8  # Radarr profile ID
-  root_folder: "/data/media/movies"  # movie root folder
+  quality_profile: 8        # Radarr quality profile ID (e.g., RARBG1080p265Python)
+  quality_threshold: 18    # Upgrade until this custom format score
+  root_folder: "/data/media/movies"
+
+debug_logging: false
+debug_mode: false
