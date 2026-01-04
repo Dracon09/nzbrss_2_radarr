@@ -1,0 +1,13 @@
+# Virtual environment
+.venv/
+
+# Local config and secrets
+config/.env
+
+# Runtime logs
+config/script.log
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
