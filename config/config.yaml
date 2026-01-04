@@ -34,7 +34,7 @@ not_match_patterns:
   - "(?=.*NORWEGIAN.*)"
   - "(?=.*DUTCH.*)"
   - "(?=.*POLISH.*)"
-  - "(?=.*TAGALOG.*)"
+#  - "(?=.*TAGALOG.*)"
   - "(?=.*THAI.*)"
 
 execution_interval: 30  # Time in minutes (adjust as needed)
