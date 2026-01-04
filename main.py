@@ -1,71 +1,88 @@
-from modules.config import load_config, setup_logging
-from modules.radarr import setup_radarr
-from modules.rss import run_rss_processing
-from modules.util import setup_signals, countdown, listen_for_manual_run
-import threading
-import sys
+# main.py
+
+import time
 import logging
+import sys
+from logging.handlers import TimedRotatingFileHandler
 import os
 
+from modules.config import load_config
+from modules.radarr_pyarr import RadarrProcessor
+from modules.rss import run_rss_sync
 
-# Global Counters
-total_added = total_exists = total_invalid = total_excluded = 0
 
-def is_docker() -> bool:
-    """Detect if running inside a Docker container."""
-    return os.path.exists("/.dockerenv") or os.path.isfile("/proc/1/cgroup") and "docker" in open("/proc/1/cgroup", "rt").read()
+def setup_logging(config):
+    log_path = os.path.join(config.config_folder, "script.log")
+
+    # Remove default handlers to prevent duplication
+    root = logging.getLogger()
+    if root.handlers:
+        for handler in root.handlers:
+            root.removeHandler(handler)
+
+    log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # File Handler
+    file_handler = TimedRotatingFileHandler(
+        log_path, when="midnight", interval=1,
+        backupCount=config.log_retention_days, encoding="utf-8"
+    )
+    file_handler.setFormatter(log_formatter)
+
+    # Console Handler
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(log_formatter)
+
+    logging.basicConfig(
+        level=logging.DEBUG if config.debug_mode else logging.INFO,
+        handlers=[file_handler, stream_handler],
+        force=True
+    )
+
 
 def main():
-    config = load_config()
-    setup_logging(config)
+    # 1. Load Config
+    try:
+        config = load_config()
+        setup_logging(config)
+    except Exception as e:
+        print(f"Startup Error: {e}")
+        return
 
-    logging.info("*******************************************************************************************")
-    logging.info("  _   _ __________  ______             _           ")
-    logging.info(" | \\ | |___  /  _ \\|  ___|(_)         | |          ")
-    logging.info(" |  \\| |  / /| |_) | |__   _ _ __   __| | ___ _ __ ")
-    logging.info(" | . ` | / / |  _ <|  __| | | '_ \\ / _` |/ _ \\ '__|")
-    logging.info(" | |\\  |/ /__| |_) | |    | | | | | (_| |  __/ |   ")
-    logging.info(" |_| \\_/_____|____/|_|    |_|_| |_|\\__,_|\\___|_|   ")
-    logging.info("*******************************************************************************************")
-    logging.info("🚀 Loaded configuration from config.yaml")
+    logging.info("***********************************************")
+    logging.info("🚀 NZBFinder 2 Radarr (Sync Mode) Started")
+    logging.info("***********************************************")
 
-    radarr = setup_radarr(config.radarr_url, config.radarr_api_key)
-    stop_event, manual_event = setup_signals()
+    # 2. Init Engine
+    processor = RadarrProcessor(
+        url=config.radarr_url,
+        api_key=config.radarr_api_key,
+        threshold=config.radarr.quality_threshold
+    )
 
-    if config.use_keyboard and not is_docker():
-        threading.Thread(target=listen_for_manual_run, args=(manual_event, stop_event), daemon=True).start()
-    else:
-        logging.info("⌨️ Keyboard input disabled (not supported in Docker)")
+    # 3. Main Loop
+    while True:
+        try:
+            start_time = time.time()
+            added, exists, excluded = run_rss_sync(config, processor)
 
-    # Initialize cumulative counters
-    total_added = total_exists = total_invalid = total_excluded = 0
+            duration = round(time.time() - start_time, 2)
+            logging.info(f"📊 Report: Pushed={added} | Exists/Skipped={exists} | Time={duration}s")
 
-    def run_and_log():
-        nonlocal total_added, total_exists, total_invalid, total_excluded
-        added, exists, invalid, excluded = run_rss_processing(config, radarr, stop_event)
-        total_added += added
-        total_exists += exists
-        total_invalid += invalid
-        total_excluded += excluded
+        except KeyboardInterrupt:
+            logging.info("🛑 Stop signal received. Exiting.")
+            break
+        except Exception as e:
+            logging.error(f"❌ Critical Loop Error: {e}")
 
-        logging.info(
-            f"📊 Cumulative Summary: "
-            f"Total Added: {total_added}, "
-            f"Total Exists: {total_exists}, "
-            f"Total Invalid: {total_invalid}, "
-            f"Total Excluded: {total_excluded}"
-        )
+        # Sleep
+        logging.info(f"💤 Sleeping for {config.execution_interval} minutes...")
+        try:
+            time.sleep(config.execution_interval * 60)
+        except KeyboardInterrupt:
+            logging.info("🛑 Stop signal received. Exiting.")
+            break
 
-    # First run
-    run_and_log()
-
-    while not stop_event.is_set():
-        if countdown(config.execution_interval * 60, manual_event, stop_event):
-            logging.info("🟢 Manual execution triggered!")
-            manual_event.clear()
-        run_and_log()
-
-    logging.info("🛑 Exiting.")
 
 if __name__ == "__main__":
     main()
