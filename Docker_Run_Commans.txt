@@ -1,0 +1,34 @@
+# Get to folder
+cd /mnt/user/appdata/nzbfinder_2_radarr_2
+
+# Stop and remove the conatiner
+docker rm -f nzbfinder2radarr
+
+# Make file/folder changes
+
+# Build Container Image
+docker build -t nzbfinder2radarr:latest .
+
+
+# Docker run command
+docker run \
+  -e "HTTP_PROXY=http://192.168.0.220:8118" \
+  -e "HTTPS_PROXY=http://192.168.0.220:8118" \
+  -e "TZ=America/New_York" \
+  -e "PUID=99" \
+  -e "PGID=100" \
+  --network=br0 \
+  --ip 192.168.0.210 \
+  --cpuset-cpus='5' \
+  -h nzbfinder2radarr \
+  --name nzbfinder2radarr \
+  -e PYTHONUNBUFFERED=1 \
+  -d \
+  -l net.unraid.docker.icon='https://d4.alternativeto.net/qkNUjgUR5atp2X8BivOIxCLJUfJdH-1bbhG3P6igyNM/rs:fill:280:280:0/g:ce:0:0/YWJzOi8vZGlzdC9pY29ucy90b3JyZW50LWdhbGF4eV8yMTgwMjIucG5n.png' \
+  -v /mnt/user/appdata/nzbfinder_2_radarr_2/config:/app/config:rw \
+  -v /etc/localtime:/etc/localtime:ro \
+  nzbfinder2radarr:latest
+
+
+# Bash into the container
+docker exec -it nzbfinder2radarr /bin/bash

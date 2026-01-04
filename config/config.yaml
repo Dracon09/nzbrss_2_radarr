@@ -1,0 +1,51 @@
+match_patterns:
+  # - ".*(?=.*1080p)(?=.*(?:BluRay|WEBRip)).*?(?=.*(?:x|h)?26[45])(?=.*(?:-RARBG|-INFINITY))"
+  # - ".*(?=.*1080p)(?=.*(?:BluRay|WEBRip)).*?(?=.*(?:x|h)?26[45])(?=.*(?:-GalaxyRG))"
+  # - ".*(?=.*1080p).*?(?=.*(?:BluRay|WEBRip)).*?(?=.*(?:x|h)?26[45]).*?(?=.*(?:-RARBG|-INFINITY))"
+  # - ".*(?=.*1080p).*?(?=.*(?:WEB-DL|BluRay|WEB|WEBRip)).*?(?=.*HEVC x265|(?=.*(?:x|h)?26[45])).*?(?=.*(?:BONE|-RMTeam|edge2020|YTS.MX|-GalaxyRG|-RARBG|-KONTRAST))"
+  # KEEP #
+  # - ".*(?=.*1080p).*?(?=.*(?:BluRay|WEBRip)).*?(?=.*(?:x|h)?26[45]).*?(?=.*(?:-RARBG|-KONTRAST|-INFINITY))"
+  # - ".*(?=.*1080p).*?(?=.*(?:BluRay|WEBRip)).*?(?=.*(?:x|h)?26[45]).*?(?=.*(?:-GalaxyRG))"
+  # - ".*(?=.*1080p).*?(?=.*(?:WEB-DL|BluRay|WEB)).*?(?=.*HEVC x265).*?(?=.*BONE|-RMTeam)"
+  # - ".*(?=.*1080p).*?(?=.*(?:BluRay|WEBRip)).*?(?=.*(?:x|h)?26[45]).*?(?=.*(?=.*edge2020))"
+  # - ".*(?=.*1080p).*?(?=.*(?:BluRay|WEBRip)).*?(?=.*(?=.*YTS.MX))"
+  # - ".*(?=.*1080p)(?=.*(?:BluRay|WEBRip|HDRip|WEB-DL)).*?(?=.*(?:x265|HEVC|x264|h264|h265)).*GalaxyRG265"
+  - "^(?=.*\\b1080p\\b)(?=.*\\b(?:WEBRip|BluRay)\\b)(?=.*\\b-LAMA\\b).*"
+  - "^(?=.*\\b1080p\\b)(?=.*\\b(?:WEBRip|BluRay)\\b)(?=.*\\b(?:x264|x265|h264|h265|HEVC)\\b)(?=.*\\b-PSA\\b).*"
+
+
+not_match_patterns:
+  - "(?=.*KOREAN.*)"
+  - "(?=.*FRENCH.*)"
+  - "(?=.*DANISH.*)"
+  - "(?=.*SWEDISH.*)"
+  - "(?=.*GERMAN.*)"
+  - "(?=.*SPANISH.*)"
+  - "(?=.*PORTUGUESE.*)"
+  - "(?=.*JAPANESE.*)"
+  - "(?=.*ITALIAN.*)"
+  - "(?=.*TURKISH.*)"
+  - "(?=.*INDONESIAN.*)"
+  - "(?=.*CHINESE.*)"
+  - "(?=.*NORWEGIAN.*)"
+  - "(?=.*DUTCH.*)"
+  - "(?=.*POLISH.*)"
+#  - "(?=.*TAGALOG.*)"
+#  - "(?=.*THAI.*)"
+
+execution_interval: 30  # Time in minutes (adjust as needed)
+max_stored_guids: 1000 # max history of rss GUIDs to keep
+debug_mode: false  # Set to true to ignore scanned_guids.txt
+debug_logging: false  # Set to true to show more info
+movie_folder: "/data/media/movies" # movie location
+quality_profile: "RARBG1080p265Pyhton" # Radarr profile matching
+use_keyboard: true  # Enable keyboard functionality when not in Docker
+
+rss_feeds:
+  - name: "NZBFinder"
+    url: "https://nzbfinder.ws/rss/category?id=2040&dl=1&num=50&api_token=${NZBFINDER_API_KEY}"
+  - name: "NZBgeek"
+    url: "https://api.nzbgeek.info/rss?t=2040&limit=100&dl=1&r=${NZBGEEK_API_KEY}"
+
+
+log_retention_days: 7  # default to 7 days
