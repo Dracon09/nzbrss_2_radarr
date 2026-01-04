@@ -18,6 +18,92 @@ def compile_patterns(config):
     return inc, exc
 
 
+def _extract_entry_fields(itm: ET.Element):
+    """
+    Defensive extractor for an <item> element from different NZB/newznab feeds.
+    Returns a tuple: (title, nzb_url, pubDate, guid, imdb_digits_or_None)
+    - imdb is returned without the 'tt' prefix (e.g. '17154734') if found.
+    """
+    # Title
+    title = itm.findtext("title") or itm.findtext("{http://purl.org/dc/elements/1.1/}title")
+
+    # NZB URL: prefer enclosure url, then link element
+    nzb_url = None
+    enc = itm.find("enclosure")
+    if enc is not None:
+        nzb_url = enc.get("url") or enc.get("href")
+    if not nzb_url:
+        nzb_url = itm.findtext("link")
+
+    # pubDate
+    pubdate = itm.findtext("pubDate") or itm.findtext("published") or itm.findtext("{http://purl.org/dc/elements/1.1/}date")
+
+    # GUID: prefer <guid>, then newznab attr 'guid', then link fallback
+    guid = itm.findtext("guid") or itm.findtext("id") or itm.findtext("link")
+
+    # Scan for newznab:attr elements (namespace-agnostic)
+    imdb_val = None
+    guid_attr_val = None
+    for elem in itm.iter():
+        tag = elem.tag
+        # ElementTree represents namespaced tags as '{ns}local'
+        if isinstance(tag, str) and (tag.endswith("}attr") or tag == "attr"):
+            name = elem.get("name")
+            value = elem.get("value")
+            if not name or value is None:
+                continue
+            lname = name.lower()
+            if lname == "imdb" and value:
+                # NZBgeek provides imdb without 'tt' prefix (e.g. 17154734 or padded 00101531)
+                imdb_val = value.strip()
+            if lname == "guid" and value:
+                guid_attr_val = value.strip()
+
+    # If guid missing, try guid_attr
+    if (not guid or guid.strip() == "") and guid_attr_val:
+        guid = guid_attr_val
+
+    # If imdb still missing, try to extract from description/summary with regex
+    if not imdb_val:
+        desc = itm.findtext("description") or itm.findtext("summary") or ""
+        if desc:
+            m = re.search(r'imdb\.com/title/(?:tt)?(\d{6,9})', desc, re.IGNORECASE)
+            if m:
+                imdb_val = m.group(1)
+            else:
+                # fallback: look for newznab attr in raw description text
+                m2 = re.search(r'<newznab:attr\s+name=["\']imdb["\']\s+value=["\'](\d{6,9})["\']', desc, re.IGNORECASE)
+                if m2:
+                    imdb_val = m2.group(1)
+
+    # Normalize imdb_val: strip leading zeros only while the value is longer than 7 digits.
+    # This fixes padded values like "00101531" -> "0101531" (so tt0101531),
+    # while preserving legitimate 8+ digit IDs that do not start with padding zeros.
+    if imdb_val and imdb_val.isdigit():
+        # Remove leading zeros while length > 7
+        while len(imdb_val) > 7 and imdb_val.startswith("0"):
+            imdb_val = imdb_val[1:]
+
+    # Normalize guid to a short token for dedupe: prefer last path segment if guid looks like a URL
+    clean_guid = None
+    if guid:
+        g = guid.strip()
+        # If guid is a URL, take last path segment or query id
+        # e.g. https://.../geekseek.php?guid=4eb5...  -> extract guid param
+        if "/" in g:
+            qmatch = re.search(r'[?&](?:id|guid)=([^&]+)', g)
+            if qmatch:
+                clean_guid = qmatch.group(1)
+            else:
+                clean_guid = g.rstrip("/").split("/")[-1]
+        else:
+            clean_guid = g
+    else:
+        clean_guid = "unknown"
+
+    return title, nzb_url, pubdate, clean_guid, imdb_val
+
+
 def run_rss_sync(config, radarr_processor):
     added = exists = excluded = 0
 
@@ -65,15 +151,13 @@ def run_rss_sync(config, radarr_processor):
             feed_new_count_before = len(new_guids)
 
             for itm in items:
-                guid = itm.findtext("guid") or itm.findtext("link")
-                clean_guid = guid.split("/")[-1] if guid else "unknown"
+                # Extract fields defensively (works for NZBFinder and NZBgeek)
+                title, nzb_url, rss_date, clean_guid, imdb_digits = _extract_entry_fields(itm)
 
                 # Already seen
                 if clean_guid in seen_set:
-                    logging.info("   [Seen] %s (guid=%s)", itm.findtext("title") or "unknown", clean_guid)
+                    logging.debug("   [Seen] %s (guid=%s)", title or "unknown", clean_guid)
                     continue
-
-                title = itm.findtext("title")
 
                 # Title filter
                 if not filter_title(title, inc_pattern, exc_pattern):
@@ -84,22 +168,31 @@ def run_rss_sync(config, radarr_processor):
                     seen_set.add(clean_guid)
                     continue
 
-                # Extract basic fields
-                nzb_url = itm.findtext("link")
-                rss_date = itm.findtext("pubDate")
+                # If we couldn't find an NZB URL, skip
+                if not nzb_url:
+                    logging.debug("   Skipping entry without NZB URL: %s (guid=%s)", title or "unknown", clean_guid)
+                    new_guids.append(clean_guid)
+                    seen_set.add(clean_guid)
+                    excluded += 1
+                    continue
 
-                # Extract IMDb id
+                # Normalize IMDb id (add 'tt' prefix if digits found)
                 imdb_id = None
-                for attr in itm.findall(".//{https://nzbfinder.ws/rsshelp/}attr"):
-                    if attr.get("name") == "imdb":
-                        imdb_id = attr.get("value")
-                if not imdb_id:
-                    for attr in itm.findall(".//{http://www.newznab.com/DTD/2010/feeds/attributes/}attr"):
-                        if attr.get("name") == "imdb":
-                            imdb_id = attr.get("value")
+                if imdb_digits:
+                    imdb_digits = imdb_digits.strip()
+                    # Some feeds include leading 'tt' accidentally; strip it
+                    imdb_digits = imdb_digits[2:] if imdb_digits.startswith("tt") else imdb_digits
+                    if imdb_digits.isdigit():
+                        imdb_id = f"tt{imdb_digits}"
 
-                if imdb_id and not imdb_id.startswith("tt"):
-                    imdb_id = f"tt{imdb_id}"
+                # If no imdb in attrs, try to extract from title as a fallback (existing helper or regex)
+                if not imdb_id and title:
+                    m = re.search(r'(tt\d{6,9}|\d{6,9})', title)
+                    if m:
+                        candidate = m.group(1)
+                        candidate = candidate[2:] if candidate.startswith("tt") else candidate
+                        if candidate.isdigit():
+                            imdb_id = f"tt{candidate}"
 
                 # Log match when we have title + imdb
                 if imdb_id and title:
@@ -120,7 +213,7 @@ def run_rss_sync(config, radarr_processor):
                     logging.info("   ✅ PUSHED: %s (%s)", title, imdb_id)
                     added += 1
                 elif result == "ADDED":
-                    logging.info(f" ➕ ADDED: {title} ({imdb_id})")
+                    logging.info("   ➕ ADDED: %s (%s)", title, imdb_id)
                     added += 1
                 elif result == "QUALITY_MET":
                     logging.info("   ℹ️ QUALITY MET: %s (%s)", title, imdb_id)

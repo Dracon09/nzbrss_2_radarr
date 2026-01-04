@@ -4,7 +4,8 @@ import logging
 import email.utils
 import datetime
 import json
-from typing import Optional, Any, Dict, List
+import time
+from typing import Optional, Any, Dict, List, Tuple
 from pyarr import RadarrAPI
 
 log = logging.getLogger(__name__)
@@ -15,6 +16,17 @@ class RadarrProcessor:
     Wrapper around pyarr.RadarrAPI with helper logic for processing NZB releases.
     Stores both the Radarr quality profile id and the custom upgrade threshold.
     """
+
+    def _info(self, msg: str, *args, **kwargs) -> None:
+        """
+        Log an INFO message with consistent indentation so icons line up with root logs.
+        Use this for all user-facing INFO messages that include icons.
+        """
+        try:
+            log.info("    " + msg, *args, **kwargs)
+        except Exception:
+            # fallback to plain logging if formatting fails
+            log.info(msg, *args, **kwargs)
 
     def __init__(self, url: str, api_key: str, quality_profile: int, threshold: int, root_folder: str):
         self.api = RadarrAPI(url, api_key)
@@ -34,7 +46,8 @@ class RadarrProcessor:
                 profiles = self.api.get_profiles()
             if profiles:
                 for p in profiles:
-                    log.info("🎬 Radarr Quality Profile: %s - %s", p.get("id"), p.get("name"))
+                    # use helper so emoji lines align with root logs
+                    self._info("🎬 Radarr Quality Profile: %s - %s", p.get("id"), p.get("name"))
         except Exception as e:
             log.debug("Could not fetch Radarr quality profiles: %s", e, exc_info=True)
 
@@ -53,6 +66,81 @@ class RadarrProcessor:
                     return int(q["id"])
         except Exception:
             log.debug("Could not parse quality id from file entry", exc_info=True)
+        return None
+
+    def _get_existing_file_score(self, movie_id: int) -> Optional[int]:
+        """
+        Try to fetch the movie's file entry and extract a best-effort score for
+        custom formats / quality. Returns an int score if found, otherwise None.
+
+        Checks common shapes:
+          - file_entry['customFormatScore']
+          - file_entry['customFormatScoreTotal']
+          - file_entry['score']
+          - file_entry['quality']['score']
+          - file_entry.get('quality', {}).get('customFormatScore')
+        """
+        try:
+            files: Optional[List[Dict]] = None
+            try:
+                if hasattr(self.api, "get_movie_files_by_movie_id"):
+                    files = self.api.get_movie_files_by_movie_id(movie_id)
+                elif hasattr(self.api, "get_movie_files"):
+                    files = self.api.get_movie_files(movie_id)
+                elif hasattr(self.api, "get_files"):
+                    files = self.api.get_files(movie_id)
+            except Exception:
+                log.debug("Fetching movie files for score extraction failed", exc_info=True)
+                files = None
+
+            if not files:
+                return None
+
+            file_entry = files[0]
+            # Try several common keys
+            candidates = []
+            try:
+                if isinstance(file_entry, dict):
+                    # direct keys
+                    for k in ("customFormatScore", "customFormatScoreTotal", "score"):
+                        v = file_entry.get(k)
+                        if v is not None:
+                            candidates.append(v)
+                    # nested quality keys
+                    q = file_entry.get("quality")
+                    if isinstance(q, dict):
+                        for k in ("score", "customFormatScore", "customFormatScoreTotal"):
+                            v = q.get(k)
+                            if v is not None:
+                                candidates.append(v)
+                    # some clients embed a 'quality' -> 'quality' dict
+                    if isinstance(q, dict):
+                        inner = q.get("quality")
+                        if isinstance(inner, dict):
+                            for k in ("score", "customFormatScore"):
+                                v = inner.get(k)
+                                if v is not None:
+                                    candidates.append(v)
+            except Exception:
+                log.debug("Error while inspecting file entry for score", exc_info=True)
+
+            # Normalize candidate to int if possible
+            for c in candidates:
+                try:
+                    if isinstance(c, (int, float)):
+                        return int(c)
+                    if isinstance(c, str) and c.isdigit():
+                        return int(c)
+                    # sometimes it's like "1.0" or "1/10" — try float then int
+                    try:
+                        f = float(str(c))
+                        return int(f)
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+        except Exception:
+            log.debug("Unexpected error extracting existing file score", exc_info=True)
         return None
 
     def _parse_pubdate(self, rss_date: Optional[str]) -> datetime.datetime:
@@ -272,7 +360,6 @@ class RadarrProcessor:
                 log.debug("Raw client add attempt failed", exc_info=True)
 
             # Verification: re-run lookup a few times (Radarr may take a moment)
-            import time
             for attempt in range(8):
                 try:
                     found = self._lookup_movie(imdb_key, title=title)
@@ -290,7 +377,7 @@ class RadarrProcessor:
 
     def process_release(self, title: str, imdb_id: str, nzb_url: str, rss_date: Optional[str]) -> str:
         """
-        Main logic: Lookup movie by IMDB id, ensure monitored, check quality, and push NZB if needed.
+        Main logic: Lookup movie by IMDB id, ensure monitored, check current quality, and push NZB if needed.
         Behavior:
           - If movie not in Radarr, attempt to add it (returns 'ADDED' on success).
           - If movie exists, ensure monitored, check current quality and push if needed.
@@ -301,12 +388,41 @@ class RadarrProcessor:
 
         publish_date = self._parse_pubdate(rss_date)
 
-        # Lookup
+        # Lookup (may return lookup/search result or library record)
         try:
             movie = self._lookup_movie(imdb_id, title=title)
         except Exception as e:
             log.error("API Error during lookup for %s: %s", imdb_id, e, exc_info=True)
             return "API_ERROR"
+
+        # Try to resolve to the authoritative library record (so we can check hasFile)
+        try:
+            # If lookup returned an entry with an id, try to fetch the full library record
+            if movie and movie.get("id"):
+                try:
+                    if hasattr(self.api, "get_movie"):
+                        try:
+                            full = self.api.get_movie(movie["id"])
+                        except Exception:
+                            try:
+                                full = self.api.get_movie(movie.get("id"))
+                            except Exception:
+                                full = None
+                        if full:
+                            movie = full
+                except Exception:
+                    log.debug("Failed to fetch full library record for id %s", movie.get("id"), exc_info=True)
+
+            # If lookup returned a remote result without id, check library by imdb
+            if (not movie or not movie.get("id")) and hasattr(self.api, "get_movie_by_imdb"):
+                try:
+                    m = self.api.get_movie_by_imdb(imdb_id)
+                    if m and m.get("id"):
+                        movie = m
+                except Exception:
+                    log.debug("get_movie_by_imdb check failed for %s", imdb_id, exc_info=True)
+        except Exception:
+            log.debug("Post-lookup resolution failed for %s", imdb_id, exc_info=True)
 
         # If not found, attempt to add
         if not movie or not movie.get("id"):
@@ -320,15 +436,21 @@ class RadarrProcessor:
             log.info("Added movie %s (%s) to Radarr. Attempting to push NZB...", title, imdb_id)
             push_result = self.push_nzb(title, nzb_url, publish_date)
 
-            # If push succeeded or was rejected, return that result; otherwise return ADDED as fallback.
-            if push_result == "PUSHED":
+            # Normalize push_result to (status, details)
+            if isinstance(push_result, tuple):
+                status, details = push_result
+            else:
+                status, details = push_result, None
+
+            if status == "PUSHED":
                 return "PUSHED"
-            if push_result == "REJECTED":
-                # If Radarr rejected the push, we already added the movie; return REJECTED so caller can handle it.
+            if status == "REJECTED":
+                # Single INFO log here with the rejection details (push_nzb logged details at DEBUG)
+                self._info("⛔ PUSH REJECTED: %s", details)
                 return "REJECTED"
 
             # If push returned ERROR/UNKNOWN_RESPONSE, still report that the movie was added.
-            log.info("Movie added but push returned %s; returning ADDED", push_result)
+            log.info("Movie added but push returned %s; returning ADDED", status)
             return "ADDED"
 
         # Ensure monitored
@@ -372,38 +494,128 @@ class RadarrProcessor:
                     current_q_val = int(current_q) if current_q is not None else 0
                     # If current quality meets or exceeds threshold, skip
                     if current_q_val >= int(self.threshold):
-                        log.info("QUALITY_MET: current %s >= threshold %s", current_q_val, self.threshold)
+                        self._info("ℹ️ QUALITY MET: current %s >= threshold %s", current_q_val, self.threshold)
                         return "QUALITY_MET"
                     # If RSS release is better than current and below threshold, attempt push
-                    log.info("⬆️ Upgrade needed: Current %s < Threshold %s; attempting push", current_q_val, self.threshold)
+                    self._info("⬆️ Upgrade needed: Current %s < Threshold %s; attempting push", current_q_val, self.threshold)
                 else:
-                    log.info("🆕 Missing file for '%s'. Pushing...", movie.get("title", "unknown"))
+                    self._info("🆕 Missing file for '%s'. Pushing...", movie.get("title", "unknown"))
             else:
-                log.info("🆕 Missing file for '%s'. Pushing...", movie.get("title", "unknown"))
+                self._info("🆕 Missing file for '%s'. Pushing...", movie.get("title", "unknown"))
         except Exception:
             log.exception("Error while evaluating current quality; proceeding to push attempt.")
 
         # Push release
         push_result = self.push_nzb(title, nzb_url, publish_date)
 
+        # Normalize push_result to (status, details)
+        if isinstance(push_result, tuple):
+            status, details = push_result
+        else:
+            status, details = push_result, None
+
         # If push rejected (often due to custom formats), attempt fallback add/search
-        if push_result == "REJECTED":
+        if status == "REJECTED":
             try:
-                log.info("Push rejected for %s (%s). Attempting fallback: add/search movie in Radarr.", title, imdb_id)
+                # Single INFO log here with the rejection details (push_nzb logged details at DEBUG)
+                self._info("⛔ PUSH REJECTED: %s", details)
+                log.debug("Inspecting rejection for %s (%s)...", title, imdb_id)
+
+                # Re-fetch authoritative movie record to see if it has a file now
+                movie_after = None
+                try:
+                    movie_after = self._lookup_movie(imdb_id, title=title)
+                    if movie_after and movie_after.get("id") and hasattr(self.api, "get_movie"):
+                        try:
+                            full = self.api.get_movie(movie_after["id"])
+                            if full:
+                                movie_after = full
+                        except Exception:
+                            pass
+                except Exception:
+                    movie_after = None
+
+                # If movie exists and hasFile True, the rejection likely means existing file meets cutoff.
+                if movie_after and movie_after.get("hasFile"):
+                    # Normalize details into a single lowercase string for robust substring checks
+                    reason_text = ""
+                    try:
+                        if details:
+                            if isinstance(details, (list, tuple)):
+                                reason_text = " ".join(str(x) for x in details)
+                            else:
+                                reason_text = str(details)
+                        reason_lc = reason_text.lower()
+                    except Exception:
+                        reason_lc = ""
+
+                    # Common phrases that indicate the rejection already explains "existing file" reasons
+                    existing_phrases = [
+                        "existing file meets cutoff",
+                        "existing file on disk",
+                        "existing file",
+                        "meets cutoff",
+                        "equal or higher",
+                        "custom format",
+                        "custom formats"
+                    ]
+
+                    # Try to fetch the existing file's score and include it in the log
+                    existing_score = None
+                    try:
+                        existing_score = self._get_existing_file_score(movie_after.get("id"))
+                    except Exception:
+                        existing_score = None
+
+                    # If any phrase appears in the rejection details, keep the inspection message quiet (DEBUG).
+                    if any(p in reason_lc for p in existing_phrases):
+                        log.debug(
+                            "Existing file present for %s (id=%s); skipping fallback add/search. Reason: %s; existing_score=%s",
+                            title, movie_after.get("id"), reason_text, existing_score
+                        )
+                    else:
+                        # Otherwise log at INFO so operators still see the reason
+                        self._info(
+                            "Existing file present for %s (id=%s); skipping fallback add/search. Reason: %s; existing_score=%s",
+                            title, movie_after.get("id"), reason_text, existing_score
+                        )
+                    return "QUALITY_MET"
+
+                # Otherwise, attempt fallback add/search (only when movie missing or no file)
+                self._info("Attempting fallback: add/search movie in Radarr for %s (%s).", title, imdb_id)
                 added_ok = self._ensure_movie_in_radarr(imdb_id, title=title, force_search=True)
                 if added_ok:
-                    log.info("Fallback add/search triggered for %s (%s).", title, imdb_id)
+                    self._info("Fallback add/search triggered for %s (%s).", title, imdb_id)
                     return "ADDED"
                 else:
                     log.warning("Fallback add/search failed for %s (%s).", title, imdb_id)
+                    return "NOT_IN_LIBRARY"
+
             except Exception:
                 log.exception("Fallback after push rejection failed for %s (%s).", title, imdb_id)
+                return "ERROR"
 
-        return push_result
+        # If pushed successfully
+        if status == "PUSHED":
+            return "PUSHED"
 
-    def push_nzb(self, title: str, url: str, date_obj: datetime.datetime) -> str:
+        # Unknown or error states
+        if status == "UNKNOWN_RESPONSE":
+            return "UNKNOWN_RESPONSE"
+        if status == "ERROR":
+            return "ERROR"
+
+        return "ERROR"
+
+    def push_nzb(self, title: str, url: str, date_obj: datetime.datetime) -> Tuple[str, Optional[Any]]:
         """
         Push an NZB to Radarr using the client's push endpoint.
+
+        Returns a tuple: (status, details)
+          - ("PUSHED", None) on success
+          - ("REJECTED", rejection_details) when Radarr rejects the push
+          - ("UNKNOWN_RESPONSE", raw_response) for unexpected shapes
+          - ("ERROR", error_info) on exceptions
         """
         try:
             res: Any = None
@@ -420,29 +632,31 @@ class RadarrProcessor:
                         res = self.api.push_release(title=title, download_url=url, protocol="usenet", publish_date=date_obj)
                     except Exception as e:
                         log.error("No push method available on RadarrAPI client: %s", e, exc_info=True)
-                        return "ERROR"
+                        return ("ERROR", str(e))
 
             # Handle list response
             if isinstance(res, list) and len(res) > 0:
                 first = res[0]
                 if first.get("approved"):
-                    log.info("✅ PUSH APPROVED: %s", title)
-                    return "PUSHED"
+                    # use helper so emoji lines align with root logs
+                    self._info("✅ PUSH APPROVED: %s", title)
+                    return ("PUSHED", None)
                 else:
-                    log.info("⛔ PUSH REJECTED: %s", first.get("rejections"))
-                    return "REJECTED"
+                    # keep detailed rejection info at DEBUG; return structured tuple
+                    log.debug("Push rejected details: %s", first.get("rejections"))
+                    return ("REJECTED", first.get("rejections"))
 
             # Handle dict response
             if isinstance(res, dict):
                 if res.get("approved"):
-                    log.info("✅ PUSH APPROVED: %s", title)
-                    return "PUSHED"
+                    self._info("✅ PUSH APPROVED: %s", title)
+                    return ("PUSHED", None)
                 if res.get("rejections"):
-                    log.info("⛔ PUSH REJECTED: %s", res.get("rejections"))
-                    return "REJECTED"
+                    log.debug("Push rejected details: %s", res.get("rejections"))
+                    return ("REJECTED", res.get("rejections"))
 
-            log.warning("Unknown push response shape: %s", type(res))
-            return "UNKNOWN_RESPONSE"
+            log.debug("Unknown push response shape: %s", type(res))
+            return ("UNKNOWN_RESPONSE", res)
         except Exception as e:
-            log.error("Push Exception: %s", e, exc_info=True)
-            return "ERROR"
+            log.exception("Push Exception: %s", e, exc_info=True)
+            return ("ERROR", str(e))

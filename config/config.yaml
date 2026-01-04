@@ -46,8 +46,8 @@ use_keyboard: true  # Enable keyboard functionality when not in Docker
 rss_feeds:
   - name: "NZBFinder"
     url: "https://nzbfinder.ws/rss/category?id=2040&dl=1&num=50&api_token=${NZBFINDER_API_KEY}"
-  # - name: "NZBgeek"
-  #  url: "https://api.nzbgeek.info/rss?t=2040&limit=100&dl=1&r=${NZBGEEK_API_KEY}"
+  - name: "NZBgeek"
+    url: "https://api.nzbgeek.info/rss?t=2040&limit=100&dl=1&r=${NZBGEEK_API_KEY}"
 
 
 log_retention_days: 7  # default to 7 days
@@ -56,6 +56,3 @@ radarr:
   quality_profile: 8        # Radarr quality profile ID (e.g., RARBG1080p265Python)
   quality_threshold: 18    # Upgrade until this custom format score
   root_folder: "/data/media/movies"
-
-debug_logging: false
-debug_mode: false

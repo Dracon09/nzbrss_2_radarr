@@ -57,9 +57,6 @@ def setup_logging(config):
         getattr(config, "debug_logging", False)
     )
 
-
-
-
 def main():
     # 1. Load Config
     try:
@@ -80,13 +77,6 @@ def main():
     logging.info("*******************************************************************************************")
     logging.info("🚀 Loaded configuration from config.yaml")
 
-    # Log key config values (hide secrets)
-    logging.info("🎬 RadarrPyarr initialized")
-    logging.info("    Quality Profile: %s", getattr(config.radarr, "quality_profile", "N/A"))
-    logging.info("    Quality Threshold: %s", getattr(config.radarr, "quality_threshold", "N/A"))
-    logging.info("    Root Folder: %s", getattr(config.radarr, "root_folder", "N/A"))
-    logging.info("    Radarr URL: %s", config.radarr_url or "N/A")
-    logging.info("    Radarr API Key: %s", "***hidden***")
 
     # 2. Init Engine
     processor = RadarrProcessor(
