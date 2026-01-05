@@ -4,8 +4,23 @@ import os
 import re
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 from modules.util import filter_title, redact_url_query
+
+
+# Module-level HTTP session with retries/backoff to make feed fetching more resilient
+_session = requests.Session()
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,                # 1s, 2s, 4s backoff
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "HEAD"]
+)
+_adapter = HTTPAdapter(max_retries=_retry_strategy)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
 
 
 def expand_url(url):
@@ -141,8 +156,22 @@ def run_rss_sync(config, radarr_processor):
         logging.info("📡 Fetching RSS: %s (%s)", feed.name, clean_log_url)
 
         try:
-            response = requests.get(real_url, timeout=30)
-            response.raise_for_status()
+            # Use the resilient session with retries
+            try:
+                response = _session.get(real_url, timeout=30)
+                response.raise_for_status()
+            except requests.exceptions.ConnectionError as ce:
+                # Detect DNS resolution issues specifically for clearer logging
+                cause = getattr(ce, "__cause__", None)
+                if cause and "NameResolutionError" in type(cause).__name__:
+                    logging.error("❌ DNS resolution failed for feed %s (%s). Check DNS, VPN, proxy, or hosts file.", feed.name, clean_log_url)
+                else:
+                    logging.error("❌ Connection error fetching feed %s: %s", feed.name, ce)
+                # continue to next feed without traceback noise
+                continue
+            except requests.exceptions.RequestException as rexc:
+                logging.error("❌ Error fetching feed %s: %s", feed.name, rexc)
+                continue
 
             root = ET.fromstring(response.content)
             items = root.findall("./channel/item")
@@ -241,7 +270,8 @@ def run_rss_sync(config, radarr_processor):
             logging.info("   Feed %s: new GUIDs this run: %d", feed.name, feed_new)
 
         except Exception as e:
-            logging.error("❌ Error fetching feed %s: %s", feed.name, e, exc_info=True)
+            # Catch-all for unexpected parsing errors per-feed; log and continue
+            logging.error("❌ Error processing feed %s: %s", feed.name, e, exc_info=True)
 
     # Persist GUIDs preserving order and keeping only the last N
     if new_guids:

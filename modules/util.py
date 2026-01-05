@@ -36,3 +36,15 @@ def redact_url_query(url: str, sensitive_keys: List[str] = ["apikey", "api_token
         return urlunparse(parsed._replace(query=redacted_query))
     except Exception:
         return "redacted_url_error"
+
+ICON_WIDTH = 3  # visual column width for emoji alignment
+
+
+def log_icon(logger, icon: str, message: str, level: str = "info"):
+    """
+    Log a message with a fixed-width emoji/icon column so icons align
+    across all modules and loggers.
+    """
+    padded_icon = f"{icon:<{ICON_WIDTH}}"
+    log_func = getattr(logger, level, logger.info)
+    log_func(f"{padded_icon} {message}")
