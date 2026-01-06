@@ -37,7 +37,7 @@ not_match_patterns:
 #  - "(?=.*TAGALOG.*)"
   - "(?=.*THAI.*)"
 
-execution_interval: 30  # Time in minutes (adjust as needed)
+execution_interval: 15  # Time in minutes (adjust as needed)
 max_stored_guids: 1000 # max history of rss GUIDs to keep
 debug_mode: false  # Set to true to ignore scanned_guids.txt
 debug_logging: false  # Set to true to show more info

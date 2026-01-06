@@ -123,8 +123,12 @@ def main():
             api_key=radarr_api_key,
             quality_profile=int(quality_profile),
             threshold=int(quality_threshold),
-            root_folder=root_folder
+            root_folder=root_folder,
+            tmdb_api_key=os.getenv("TMDB_API_KEY")  # pass TMDb key from environment
         )
+        # optional: log whether the key was provided
+        logging.info("RadarrProcessor tmdb_api_key present: %s", bool(processor.tmdb_api_key))
+
     except Exception as e:
         logging.exception("Failed to initialize RadarrProcessor: %s", e)
         return

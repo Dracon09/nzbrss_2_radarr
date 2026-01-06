@@ -1,662 +1,648 @@
 # modules/radarr_pyarr.py
-
 import logging
-import email.utils
-import datetime
-import json
 import time
-from typing import Optional, Any, Dict, List, Tuple
-from pyarr import RadarrAPI
+import json
+from typing import Optional, Tuple, Any, Dict
+from urllib.parse import urljoin
+
+import requests
 
 log = logging.getLogger(__name__)
 
 
 class RadarrProcessor:
     """
-    Wrapper around pyarr.RadarrAPI with helper logic for processing NZB releases.
-    Stores both the Radarr quality profile id and the custom upgrade threshold.
+    Lightweight Radarr helper used by the RSS pipeline.
+    - Prefers direct HTTP calls to Radarr's API for predictable payload shapes.
+    - Will attempt to use a pyarr-like client if provided on self.api, but falls back to requests.
     """
 
-    def _info(self, msg: str, *args, **kwargs) -> None:
-        """
-        Log an INFO message with consistent indentation so icons line up with root logs.
-        Use this for all user-facing INFO messages that include icons.
-        """
-        try:
-            log.info("    " + msg, *args, **kwargs)
-        except Exception:
-            # fallback to plain logging if formatting fails
-            log.info(msg, *args, **kwargs)
-
-    def __init__(self, url: str, api_key: str, quality_profile: int, threshold: int, root_folder: str):
-        self.api = RadarrAPI(url, api_key)
-        self.base_url = url.rstrip("/") if url else ""
+    def __init__(
+        self,
+        url: str,
+        api_key: str,
+        quality_profile: int = 1,
+        threshold: int = 0,
+        root_folder: str = "/",
+        tmdb_api_key: Optional[str] = None,
+        session: Optional[requests.Session] = None,
+    ):
+        self.base_url = url.rstrip("/") if url else None
         self.api_key = api_key
-        self.quality_profile = quality_profile
-        self.threshold = threshold
-        # Use the configured root folder from config.yaml
-        self.root_folder = root_folder or ""
+        self.quality_profile = int(quality_profile)
+        self.threshold = int(threshold)
+        self.root_folder = root_folder
+        self.tmdb_api_key = tmdb_api_key
 
-        # Try to list quality profiles for visibility (non-fatal)
-        try:
-            profiles = None
-            if hasattr(self.api, "get_quality_profiles"):
-                profiles = self.api.get_quality_profiles()
-            elif hasattr(self.api, "get_profiles"):
-                profiles = self.api.get_profiles()
-            if profiles:
-                for p in profiles:
-                    # use helper so emoji lines align with root logs
-                    self._info("🎬 Radarr Quality Profile: %s - %s", p.get("id"), p.get("name"))
-        except Exception as e:
-            log.debug("Could not fetch Radarr quality profiles: %s", e, exc_info=True)
+        # Optional wrapper client (pyarr) may be attached externally; keep compatibility
+        self.api = None
 
-    def _safe_get_quality_id(self, file_entry: dict) -> Optional[int]:
-        """
-        Safely extract the quality id from a movie file entry returned by the API.
-        Different API versions/clients may nest this differently, so check common shapes.
-        """
+        # HTTP session with a small retry/backoff could be provided; otherwise create one
+        self._session = session or requests.Session()
+        self._session.headers.update({"X-Api-Key": self.api_key, "Content-Type": "application/json"})
+
+        # Simple on-disk cache for imdb->tmdb mappings (path relative to config folder)
+        self._cache = {}
+        self._cache_path = "cache_imdb_to_tmdb.json"
+        self._load_cache()
+
+    # -------------------------
+    # Cache helpers
+    # -------------------------
+    def _load_cache(self):
         try:
-            q = file_entry.get("quality")
-            if isinstance(q, dict):
-                inner = q.get("quality")
-                if isinstance(inner, dict) and "id" in inner:
-                    return int(inner["id"])
-                if "id" in q:
-                    return int(q["id"])
+            with open(self._cache_path, "r", encoding="utf-8") as f:
+                self._cache = json.load(f)
         except Exception:
-            log.debug("Could not parse quality id from file entry", exc_info=True)
-        return None
+            self._cache = {}
 
-    def _get_existing_file_score(self, movie_id: int) -> Optional[int]:
-        """
-        Try to fetch the movie's file entry and extract a best-effort score for
-        custom formats / quality. Returns an int score if found, otherwise None.
-
-        Checks common shapes:
-          - file_entry['customFormatScore']
-          - file_entry['customFormatScoreTotal']
-          - file_entry['score']
-          - file_entry['quality']['score']
-          - file_entry.get('quality', {}).get('customFormatScore')
-        """
+    def _save_cache(self):
         try:
-            files: Optional[List[Dict]] = None
+            with open(self._cache_path, "w", encoding="utf-8") as f:
+                json.dump(self._cache, f)
+        except Exception:
+            log.debug("Failed to save imdb->tmdb cache", exc_info=True)
+
+    # -------------------------
+    # Low-level HTTP helpers
+    # -------------------------
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 15,
+             retries: int = 3) -> requests.Response:
+        url = urljoin(self.base_url + "/", path.lstrip("/"))
+        last_exc = None
+        for attempt in range(1, retries + 1):
             try:
-                if hasattr(self.api, "get_movie_files_by_movie_id"):
-                    files = self.api.get_movie_files_by_movie_id(movie_id)
-                elif hasattr(self.api, "get_movie_files"):
-                    files = self.api.get_movie_files(movie_id)
-                elif hasattr(self.api, "get_files"):
-                    files = self.api.get_files(movie_id)
-            except Exception:
-                log.debug("Fetching movie files for score extraction failed", exc_info=True)
-                files = None
+                return self._session.get(url, params=params, timeout=timeout)
+            except requests.exceptions.ReadTimeout as e:
+                last_exc = e
+                log.debug("GET %s timed out (attempt %s/%s)", path, attempt, retries)
+                time.sleep(0.5 * attempt)
+            except Exception as e:
+                last_exc = e
+                log.debug("GET %s failed (attempt %s/%s): %s", path, attempt, retries, e)
+                time.sleep(0.5 * attempt)
+        raise last_exc
 
-            if not files:
-                return None
+    def _post(self, path: str, json_payload: Dict[str, Any], timeout: int = 15) -> requests.Response:
+        if not self.base_url:
+            raise RuntimeError("Radarr base_url not configured")
+        url = urljoin(self.base_url + "/", path.lstrip("/"))
+        return self._session.post(url, json=json_payload, timeout=timeout)
 
-            file_entry = files[0]
-            # Try several common keys
-            candidates = []
-            try:
-                if isinstance(file_entry, dict):
-                    # direct keys
-                    for k in ("customFormatScore", "customFormatScoreTotal", "score"):
-                        v = file_entry.get(k)
-                        if v is not None:
-                            candidates.append(v)
-                    # nested quality keys
-                    q = file_entry.get("quality")
-                    if isinstance(q, dict):
-                        for k in ("score", "customFormatScore", "customFormatScoreTotal"):
-                            v = q.get(k)
-                            if v is not None:
-                                candidates.append(v)
-                    # some clients embed a 'quality' -> 'quality' dict
-                    if isinstance(q, dict):
-                        inner = q.get("quality")
-                        if isinstance(inner, dict):
-                            for k in ("score", "customFormatScore"):
-                                v = inner.get(k)
-                                if v is not None:
-                                    candidates.append(v)
-            except Exception:
-                log.debug("Error while inspecting file entry for score", exc_info=True)
-
-            # Normalize candidate to int if possible
-            for c in candidates:
-                try:
-                    if isinstance(c, (int, float)):
-                        return int(c)
-                    if isinstance(c, str) and c.isdigit():
-                        return int(c)
-                    # sometimes it's like "1.0" or "1/10" — try float then int
-                    try:
-                        f = float(str(c))
-                        return int(f)
-                    except Exception:
-                        pass
-                except Exception:
-                    continue
-        except Exception:
-            log.debug("Unexpected error extracting existing file score", exc_info=True)
-        return None
-
-    def _parse_pubdate(self, rss_date: Optional[str]) -> datetime.datetime:
+    # -------------------------
+    # Lookup & existence helpers
+    # -------------------------
+    def _movie_exists_locally(self, imdb_id: Optional[str] = None, tmdb_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
-        Parse RSS pubDate into a datetime. If parsing fails, return now().
+        Targeted check for a local Radarr movie. Avoids fetching the entire library.
         """
-        if not rss_date:
-            return datetime.datetime.now(datetime.timezone.utc)
         try:
-            dt = email.utils.parsedate_to_datetime(rss_date)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=datetime.timezone.utc)
-            return dt
+            # Prefer lookup by tmdbId
+            if tmdb_id:
+                term = f"tmdb:{int(tmdb_id)}"
+                log.debug("Targeted lookup by term=%s", term)
+                resp = self._get("/api/v3/movie/lookup", params={"term": term}, timeout=15)
+                if resp.ok:
+                    candidates = resp.json() or []
+                    if candidates:
+                        cand = candidates[0]
+                        radarr_id = cand.get("id")
+                        if radarr_id:
+                            r2 = self._get(f"/api/v3/movie/{radarr_id}", timeout=15)
+                            if r2.ok:
+                                return r2.json()
+                        return cand
+
+            # Fallback: lookup by imdbId
+            if imdb_id:
+                imdb_key = imdb_id if imdb_id.startswith("tt") else f"tt{imdb_id}"
+                term = f"imdb:{imdb_key}"
+                log.debug("Targeted lookup by term=%s", term)
+                resp = self._get("/api/v3/movie/lookup", params={"term": term}, timeout=15)
+                if resp.ok:
+                    candidates = resp.json() or []
+                    if candidates:
+                        cand = candidates[0]
+                        radarr_id = cand.get("id")
+                        if radarr_id:
+                            r2 = self._get(f"/api/v3/movie/{radarr_id}", timeout=15)
+                            if r2.ok:
+                                return r2.json()
+                        return cand
+
+        except requests.exceptions.ReadTimeout:
+            log.debug("Radarr targeted lookup timed out", exc_info=True)
         except Exception:
-            log.debug("Failed to parse rss pubDate, using now()", exc_info=True)
-            return datetime.datetime.now(datetime.timezone.utc)
-
-    def _lookup_movie(self, imdb_id: str, title: Optional[str] = None) -> Optional[Dict]:
-        """
-        Try multiple lookup strategies against the Radarr API to find a movie record.
-        Returns the movie dict if found, otherwise None.
-        """
-        imdb_key = imdb_id
-        try:
-            if hasattr(self.api, "get_movie_by_imdb"):
-                try:
-                    m = self.api.get_movie_by_imdb(imdb_id)
-                    if m:
-                        return m
-                except Exception:
-                    log.debug("get_movie_by_imdb failed for %s", imdb_id, exc_info=True)
-
-            if hasattr(self.api, "lookup_movie"):
-                try:
-                    key = imdb_key if imdb_key.startswith("imdb:") else f"imdb:{imdb_key}"
-                    res = self.api.lookup_movie(key)
-                    if isinstance(res, list) and res:
-                        return res[0]
-                    if isinstance(res, dict) and res.get("id"):
-                        return res
-                except Exception:
-                    log.debug("lookup_movie failed for %s", imdb_id, exc_info=True)
-        except Exception:
-            log.debug("Error while attempting imdb-based lookups", exc_info=True)
-
-        try:
-            if hasattr(self.api, "get_movie"):
-                try:
-                    m = self.api.get_movie(imdbId=imdb_id)
-                    if m:
-                        return m
-                except TypeError:
-                    try:
-                        m = self.api.get_movie(imdb_id)
-                        if m:
-                            return m
-                    except Exception:
-                        log.debug("get_movie positional attempt failed for %s", imdb_id, exc_info=True)
-                except Exception:
-                    log.debug("get_movie(imdbId=...) failed for %s", imdb_id, exc_info=True)
-        except Exception:
-            log.debug("Error while attempting get_movie", exc_info=True)
-
-        if title:
-            try:
-                if hasattr(self.api, "get_movies"):
-                    try:
-                        movies = self.api.get_movies()
-                        for m in movies:
-                            if m and m.get("title") and title.lower() in m.get("title").lower():
-                                return m
-                    except Exception:
-                        log.debug("get_movies search failed", exc_info=True)
-                if hasattr(self.api, "get_movie_by_title"):
-                    try:
-                        m = self.api.get_movie_by_title(title)
-                        if m:
-                            return m
-                    except Exception:
-                        log.debug("get_movie_by_title failed", exc_info=True)
-            except Exception:
-                log.debug("Title-based lookup failed", exc_info=True)
+            log.debug("Local movie check failed", exc_info=True)
 
         return None
 
-    def _ensure_movie_in_radarr(self, imdb_id: str, title: Optional[str] = None, force_search: bool = False) -> bool:
+    def _lookup_movie_candidates(self, term: str) -> Optional[Any]:
         """
-        Ensure the movie exists in Radarr. Try multiple client methods to add it,
-        then verify by re-running a lookup. Returns True only if the movie is
-        confirmed present in Radarr after the add/search attempt.
+        Ask Radarr's external lookup providers for candidates.
+        term examples: "imdb:tt1234567" or "tmdb:12345"
         """
         try:
-            imdb_key = imdb_id if imdb_id.startswith("tt") else f"tt{imdb_id}"
+            resp = self._get("/api/v3/movie/lookup", params={"term": term})
+            if resp.ok:
+                return resp.json()
+        except Exception:
+            log.debug("Radarr lookup failed for term=%s", term, exc_info=True)
+        return None
 
-            # Try to obtain lookup metadata (tmdbId etc.) to build a proper payload
-            lookup_meta = None
-            try:
-                if hasattr(self.api, "lookup_movie"):
-                    try:
-                        res = self.api.lookup_movie(f"imdb:{imdb_key}")
-                        if isinstance(res, list) and res:
-                            lookup_meta = res[0]
-                        elif isinstance(res, dict) and res.get("tmdbId"):
-                            lookup_meta = res
-                    except Exception:
-                        log.debug("api.lookup_movie failed", exc_info=True)
+    # -------------------------
+    # Resolve tmdb from imdb
+    # -------------------------
+    def _resolve_tmdb_from_imdb(self, imdb_id: str, force_refresh: bool = False) -> Tuple[Optional[int], str]:
+        """
+        Resolve a tmdbId for a given imdbId using:
+          1) cache (unless force_refresh=True)
+          2) local Radarr DB
+          3) Radarr external lookup
+          4) TMDb API fallback (requires tmdb_api_key)
+        Returns (tmdb_id or None, source)
+        """
+        if not imdb_id:
+            return None, "no_imdb"
 
-                if not lookup_meta and hasattr(self.api, "client") and hasattr(self.api.client, "get"):
-                    try:
-                        resp = self.api.client.get(f"/api/movie/lookup?term=imdb:{imdb_key}")
-                        if resp is not None:
-                            lookup_meta = resp[0] if isinstance(resp, list) and len(resp) > 0 else resp
-                    except Exception:
-                        log.debug("raw client lookup failed", exc_info=True)
-            except Exception:
-                log.debug("lookup attempts raised", exc_info=True)
+        imdb_key = imdb_id if imdb_id.startswith("tt") else f"tt{imdb_id}"
 
-            # Build add payload
-            payload = {
-                "title": title or "",
-                "qualityProfileId": int(self.quality_profile),
-                "rootFolderPath": self.root_folder,
-                "monitored": True,
-                "addOptions": {"searchForMovie": bool(force_search)},
-                "images": []
-            }
+        # Cache (skip when force_refresh requested)
+        if not force_refresh and imdb_key in self._cache:
+            return self._cache[imdb_key], "cache"
 
-            if lookup_meta:
-                tmdb = lookup_meta.get("tmdbId")
+        # 1) Local DB
+        try:
+            local = self._movie_exists_locally(imdb_id=imdb_key)
+            if local and local.get("tmdbId"):
+                tmdb = local.get("tmdbId")
+                self._cache[imdb_key] = tmdb
+                self._save_cache()
+                return tmdb, "local"
+        except Exception:
+            log.debug("Local lookup error", exc_info=True)
+
+        # 2) Radarr external lookup
+        try:
+            candidates = self._lookup_movie_candidates(f"imdb:{imdb_key}")
+            if candidates:
+                tmdb = candidates[0].get("tmdbId")
                 if tmdb:
-                    payload["tmdbId"] = int(tmdb)
-                if not payload["title"] and lookup_meta.get("title"):
-                    payload["title"] = lookup_meta.get("title")
+                    self._cache[imdb_key] = tmdb
+                    self._save_cache()
+                    return tmdb, "radarr_lookup"
+        except Exception:
+            log.debug("Radarr external lookup error", exc_info=True)
 
-            if "tmdbId" not in payload:
-                payload["imdbId"] = imdb_key
-
-            # Pretty-print payload for debug logs
+        # 3) TMDb API fallback
+        if self.tmdb_api_key:
             try:
-                pretty = json.dumps(payload, indent=2, sort_keys=True)
-                log.debug("Prepared Radarr add payload:\n%s", pretty)
+                log.debug("Attempting TMDb fallback for %s; tmdb_api_key present=%s", imdb_key, bool(self.tmdb_api_key))
+
+                r = requests.get(
+                    f"https://api.themoviedb.org/3/find/{imdb_key}",
+                    params={"external_source": "imdb_id", "api_key": self.tmdb_api_key},
+                    timeout=10
+                )
+
+                # log status and a short preview of the body for debugging
+                body_preview = (r.text[:1000] + '...') if r.text and len(r.text) > 1000 else r.text
+                log.debug("TMDb API response status=%s body_preview=%s", r.status_code, body_preview)
+
+                if r.ok:
+                    jr = r.json()
+                    movie_results = jr.get("movie_results") or []
+                    if movie_results:
+                        tmdb = int(movie_results[0].get("id"))
+                        self._cache[imdb_key] = tmdb
+                        self._save_cache()
+                        log.info("Resolved tmdb from TMDb API: %s -> %s", imdb_key, tmdb)
+                        return tmdb, "tmdb_api"
+                    log.debug("TMDb API returned no movie_results for %s", imdb_key)
+                else:
+                    log.warning("TMDb API returned non-OK status %s for %s", r.status_code, imdb_key)
             except Exception:
-                log.debug("Add payload prepared: %s", payload)
+                log.exception("TMDb API call failed for %s", imdb_key)
 
-            # Preflight check for required fields
-            required = ["qualityProfileId", "rootFolderPath"]
-            missing = [k for k in required if k not in payload or payload.get(k) in (None, "")]
-            if missing:
-                log.warning("Add payload missing required fields %s for imdb %s", missing, imdb_key)
-            else:
-                log.debug("Add payload has required fields for imdb %s", imdb_key)
+        return None, "not_found"
 
-            # Try pyarr convenience add methods, handle add_movie_by_imdb specially
-            # so we can pass explicit parameters Radarr expects.
-            # We still attempt other add helpers for compatibility.
-            # Do not assume success from return value; verify below.
-            try:
-                if hasattr(self.api, "add_movie_by_imdb"):
-                    try:
-                        # call with explicit args Radarr expects
-                        res = self.api.add_movie_by_imdb(
-                            imdb_key,
-                            qualityProfileId=int(self.quality_profile),
-                            rootFolderPath=self.root_folder,
-                            monitored=True,
-                            addOptions={"searchForMovie": bool(force_search)}
-                        )
-                        log.debug("add_movie_by_imdb returned: %s", res)
-                    except TypeError:
-                        # fallback if signature differs
-                        try:
-                            res = self.api.add_movie_by_imdb(imdb_key)
-                            log.debug("add_movie_by_imdb (simple) returned: %s", res)
-                        except Exception:
-                            log.debug("add_movie_by_imdb simple call failed", exc_info=True)
-                    except Exception:
-                        log.debug("add_movie_by_imdb call failed", exc_info=True)
-            except Exception:
-                log.debug("add_movie_by_imdb path error", exc_info=True)
+    # -------------------------
+    # Add helper: add movie and return Radarr id
+    # -------------------------
+    def _add_movie_and_get_id(self, imdb_id: Optional[str], tmdb_id: Optional[int], title: Optional[str]) -> Optional[int]:
+        """
+        Ensure movie exists in Radarr and return the Radarr movie id (int) if available.
+        Handles 201 Created, MovieExistsValidator (400) and targeted lookup fallback.
+        """
+        payload = {
+            "title": title or "",
+            "qualityProfileId": int(self.quality_profile),
+            "rootFolderPath": self.root_folder,
+            "monitored": True,
+            "addOptions": {"searchForMovie": True},
+            "images": []
+        }
+        if tmdb_id:
+            payload["tmdbId"] = int(tmdb_id)
+        # Use string 'tt...' form for imdbId when adding (Radarr expects string here)
+        if imdb_id:
+            imdb_key = imdb_id if imdb_id.startswith("tt") else f"tt{imdb_id}"
+            payload["imdbId"] = imdb_key
 
-            # Try other convenience methods (payload or imdb key)
-            for method_name in ("add_movie", "addMovie", "add"):
-                if hasattr(self.api, method_name):
-                    try:
+        # Try wrapper client first if available
+        try:
+            if self.api:
+                for method_name in ("add_movie_by_imdb", "add_movie", "add"):
+                    if hasattr(self.api, method_name):
                         method = getattr(self.api, method_name)
                         try:
-                            res = method(payload)
-                        except TypeError:
                             try:
-                                res = method(imdb_key)
-                            except Exception:
-                                res = None
-                        log.debug("%s returned: %s", method_name, res)
-                    except Exception:
-                        log.debug("%s failed", method_name, exc_info=True)
-
-            # Fallback: direct POST to /api/movie using requests so we always capture Radarr's response
-            try:
-                if ("tmdbId" in payload or "imdbId" in payload) and self.base_url and self.api_key:
-                    try:
-                        import requests
-                        url = f"{self.base_url}/api/v3/movie"
-                        headers = {"X-Api-Key": self.api_key, "Content-Type": "application/json"}
-                        log.debug("Attempting direct POST to Radarr: %s", url)
-                        # Log the payload being sent (already pretty-printed above)
-                        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-                        # Log status and body for diagnostics
-                        log.debug("Direct /api/movie POST status: %s", resp.status_code)
-                        try:
-                            j = resp.json()
-                            log.debug("Direct /api/movie POST json: %s", j)
+                                res = method(payload)
+                            except TypeError:
+                                res = method(tmdb_id if tmdb_id else imdb_id)
+                            log.debug("Radarr client %s returned: %s", method_name, res)
+                            if isinstance(res, dict) and res.get("id"):
+                                return int(res.get("id"))
+                            break
                         except Exception:
-                            log.debug("Direct /api/movie POST text: %s", resp.text)
-                    except Exception:
-                        log.exception("Direct requests.post to /api/movie failed", exc_info=True)
-            except Exception:
-                log.debug("Raw client add attempt failed", exc_info=True)
-
-            # Verification: re-run lookup a few times (Radarr may take a moment)
-            for attempt in range(8):
-                try:
-                    found = self._lookup_movie(imdb_key, title=title)
-                    if found and found.get("id"):
-                        log.debug("Verified movie present in Radarr after add: %s", found.get("id"))
-                        return True
-                except Exception:
-                    log.debug("Verification lookup attempt %d failed", attempt + 1, exc_info=True)
-                time.sleep(1.0)
-
+                            log.debug("Radarr client method %s failed", method_name, exc_info=True)
         except Exception:
-            log.exception("Unexpected error while trying to add movie %s", imdb_id)
+            log.debug("Radarr client add attempts raised", exc_info=True)
 
+        # Direct POST fallback
+        try:
+            resp = self._post("/api/v3/movie", payload)
+        except Exception:
+            log.exception("Direct POST to /api/v3/movie failed", exc_info=True)
+            return None
+
+        # Parse response
+        try:
+            body = resp.json() if resp.text else None
+        except Exception:
+            body = resp.text
+
+        log.debug("Direct /api/v3/movie POST status=%s body=%s", resp.status_code, body)
+
+        # 201 Created -> extract id from Location or body
+        if resp.status_code == 201:
+            loc = resp.headers.get("Location")
+            if loc:
+                try:
+                    radarr_id = int(loc.rstrip("/").split("/")[-1])
+                    return radarr_id
+                except Exception:
+                    log.debug("Failed to parse Location header for id", exc_info=True)
+            try:
+                if isinstance(body, dict) and body.get("id"):
+                    return int(body.get("id"))
+            except Exception:
+                log.debug("Failed to parse body for id", exc_info=True)
+
+        # 400 MovieExistsValidator -> targeted lookup to find id
+        if resp.status_code == 400 and isinstance(body, list):
+            for err in body:
+                if err.get("errorCode") == "MovieExistsValidator":
+                    local = self._movie_exists_locally(imdb_id=imdb_id, tmdb_id=tmdb_id)
+                    if local and local.get("id"):
+                        return int(local.get("id"))
+                    return None
+
+        # As a last resort, try targeted lookup once
+        local = self._movie_exists_locally(imdb_id=imdb_id, tmdb_id=tmdb_id)
+        if local and local.get("id"):
+            return int(local.get("id"))
+
+        return None
+
+    # -------------------------
+    # Add / ensure movie exists
+    # -------------------------
+    def _ensure_movie_in_radarr(self, imdb_id: Optional[str] = None, tmdb_id: Optional[int] = None,
+                                title: Optional[str] = None, force_search: bool = False, force_refresh: bool = False) -> bool:
+        """
+        Ensure a movie exists in Radarr. Requires a valid tmdbId to add.
+        Returns True if the movie is present after the call, False otherwise.
+
+        force_refresh: if True, skip the local cache when resolving tmdb from imdb.
+        """
+        imdb_key = None
+        if imdb_id:
+            imdb_key = imdb_id if imdb_id.startswith("tt") else f"tt{imdb_id}"
+
+        # If we don't have a tmdb_id yet, try to resolve it now (local -> radarr lookup -> tmdb API)
+        if not tmdb_id and imdb_key:
+            try:
+                resolved_tmdb, src = self._resolve_tmdb_from_imdb(imdb_key, force_refresh=force_refresh)
+                log.debug("Resolved tmdb for %s -> %s (source=%s)", imdb_key, resolved_tmdb, src)
+                if resolved_tmdb:
+                    tmdb_id = int(resolved_tmdb)
+            except Exception:
+                log.debug("Error resolving tmdb for %s", imdb_key, exc_info=True)
+
+        # If we still don't have a valid tmdb_id, do not attempt to add (Radarr requires tmdbId)
+        if not tmdb_id or int(tmdb_id) <= 0:
+            log.warning("Cannot add movie: missing valid tmdbId for imdb=%s (tmdb=%s)", imdb_key, tmdb_id)
+            return False
+
+        # Build payload using available metadata; include tmdbId only when valid (>0)
+        payload = {
+            "title": title or "",
+            "qualityProfileId": int(self.quality_profile),
+            "rootFolderPath": self.root_folder,
+            "monitored": True,
+            "addOptions": {"searchForMovie": bool(force_search)},
+            "images": []
+        }
+
+        payload["tmdbId"] = int(tmdb_id)
+        # include imdbId as string (tt-prefixed) for add payload
+        if imdb_key:
+            payload["imdbId"] = imdb_key
+
+        # Try pyarr-like convenience methods if available
+        tried = False
+        try:
+            if self.api:
+                for method_name in ("add_movie_by_imdb", "add_movie", "add"):
+                    if hasattr(self.api, method_name):
+                        method = getattr(self.api, method_name)
+                        try:
+                            try:
+                                res = method(payload)
+                            except TypeError:
+                                # some wrappers accept just an id
+                                res = method(tmdb_id if tmdb_id else imdb_key)
+                            log.debug("Radarr client %s returned: %s", method_name, res)
+                            tried = True
+                            break
+                        except Exception:
+                            log.debug("Radarr client method %s failed", method_name, exc_info=True)
+        except Exception:
+            log.debug("Radarr client add attempts raised", exc_info=True)
+
+        # Direct POST fallback to /api/v3/movie
+        if not tried and self.base_url and self.api_key:
+            try:
+                resp = self._post("/api/v3/movie", payload)
+                # after resp = self._post("/api/v3/movie", payload)
+                try:
+                    body = resp.json() if resp.text else None
+                except Exception:
+                    body = resp.text
+
+                log.debug("Direct /api/v3/movie POST status=%s body=%s", resp.status_code, body)
+
+                # 1) Created
+                if resp.status_code == 201:
+                    # Prefer to extract Radarr id from Location header if present
+                    loc = resp.headers.get("Location")
+                    if loc:
+                        try:
+                            radarr_id = int(loc.rstrip("/").split("/")[-1])
+                            r = self._get(f"/api/v3/movie/{radarr_id}", timeout=15)
+                            if r.ok:
+                                log.info("Movie added and confirmed via /api/v3/movie/%s", radarr_id)
+                                return True
+                        except Exception:
+                            log.debug("Failed to fetch movie by Location id", exc_info=True)
+                    # fallback: if body contains tmdbId/imdbId treat as success
+                    log.info("Movie added (201) but could not fetch by id immediately; treating as present.")
+                    return True
+
+                # 2) Movie already exists (400 with MovieExistsValidator)
+                if resp.status_code == 400 and isinstance(body, list):
+                    for err in body:
+                        if err.get("errorCode") == "MovieExistsValidator":
+                            log.info("Radarr reports movie already exists (tmdb=%s). Attempting targeted lookup.",
+                                     payload.get("tmdbId"))
+                            local = self._movie_exists_locally(imdb_id=payload.get("imdbId"),
+                                                               tmdb_id=payload.get("tmdbId"))
+                            if local:
+                                log.info("Found existing movie in Radarr: %s (tmdb=%s)", local.get("title"),
+                                         local.get("tmdbId"))
+                                return True
+                            log.warning("Radarr reported movie exists but targeted lookup failed; treating as present.")
+                            return True
+
+                # otherwise handle as before (log and return False)
+                if resp.status_code >= 400:
+                    log.warning("Radarr add returned status %s: %s", resp.status_code, body)
+                    return False
+
+            except Exception:
+                log.exception("Direct POST to /api/v3/movie failed", exc_info=True)
+
+        # Verify presence (Radarr may take a moment)
+        for attempt in range(6):
+            found = self._movie_exists_locally(imdb_id=imdb_key, tmdb_id=tmdb_id)
+            if found:
+                log.info("Movie present in Radarr after add/lookup: %s (tmdb=%s)", found.get("title"),
+                         found.get("tmdbId"))
+                return True
+            time.sleep(1.0)
+
+        log.warning("Failed to confirm movie in Radarr: imdb=%s tmdb=%s", imdb_key, tmdb_id)
         return False
 
-    def process_release(self, title: str, imdb_id: str, nzb_url: str, rss_date: Optional[str]) -> str:
+    # -------------------------
+    # Push NZB / release to Radarr
+    # -------------------------
+    def push_nzb(self, title: str, download_url: str, publish_date: Optional[str] = None,
+                 imdb_id: Optional[str] = None, tmdb_id: Optional[int] = None,
+                 size: Optional[int] = None, release_group: Optional[str] = None) -> Tuple[str, Any]:
         """
-        Main logic: Lookup movie by IMDB id, ensure monitored, check current quality, and push NZB if needed.
-        Behavior:
-          - If movie not in Radarr, attempt to add it (returns 'ADDED' on success).
-          - If movie exists, ensure monitored, check current quality and push if needed.
-          - If push is rejected (e.g., custom formats), attempt fallback add/search.
-        Returns one of: PUSHED, QUALITY_MET, NOT_IN_LIBRARY, API_ERROR, REJECTED, ERROR, UNKNOWN_RESPONSE, ADDED
+        Push an NZB/release to Radarr. Returns a tuple (status, details).
+        Status values: "PUSHED", "REJECTED", "UNKNOWN_RESPONSE", "ERROR", "ALREADY_HAVE_BETTER"
         """
-        log.debug("Analyzing: %s (%s)", title, imdb_id)
-
-        publish_date = self._parse_pubdate(rss_date)
-
-        # Lookup (may return lookup/search result or library record)
         try:
-            movie = self._lookup_movie(imdb_id, title=title)
-        except Exception as e:
-            log.error("API Error during lookup for %s: %s", imdb_id, e, exc_info=True)
-            return "API_ERROR"
-
-        # Try to resolve to the authoritative library record (so we can check hasFile)
-        try:
-            # If lookup returned an entry with an id, try to fetch the full library record
-            if movie and movie.get("id"):
-                try:
-                    if hasattr(self.api, "get_movie"):
+            # Try wrapper methods first if available
+            if self.api:
+                for method_name in ("post_release_push", "release_push", "push_release", "pushRelease"):
+                    if hasattr(self.api, method_name):
+                        method = getattr(self.api, method_name)
                         try:
-                            full = self.api.get_movie(movie["id"])
-                        except Exception:
+                            # try to include identifiers if method accepts kwargs
                             try:
-                                full = self.api.get_movie(movie.get("id"))
-                            except Exception:
-                                full = None
-                        if full:
-                            movie = full
-                except Exception:
-                    log.debug("Failed to fetch full library record for id %s", movie.get("id"), exc_info=True)
-
-            # If lookup returned a remote result without id, check library by imdb
-            if (not movie or not movie.get("id")) and hasattr(self.api, "get_movie_by_imdb"):
-                try:
-                    m = self.api.get_movie_by_imdb(imdb_id)
-                    if m and m.get("id"):
-                        movie = m
-                except Exception:
-                    log.debug("get_movie_by_imdb check failed for %s", imdb_id, exc_info=True)
-        except Exception:
-            log.debug("Post-lookup resolution failed for %s", imdb_id, exc_info=True)
-
-        # If not found, attempt to add
-        if not movie or not movie.get("id"):
-            log.info("Movie %s (%s) not found in Radarr. Attempting to add.", title, imdb_id)
-            added_ok = self._ensure_movie_in_radarr(imdb_id, title=title, force_search=True)
-            if not added_ok:
-                log.warning("Failed to add movie %s (%s) to Radarr.", title, imdb_id)
-                return "NOT_IN_LIBRARY"
-
-            # Movie was added (or search triggered). Attempt to push the NZB you already have.
-            log.info("Added movie %s (%s) to Radarr. Attempting to push NZB...", title, imdb_id)
-            push_result = self.push_nzb(title, nzb_url, publish_date)
-
-            # Normalize push_result to (status, details)
-            if isinstance(push_result, tuple):
-                status, details = push_result
-            else:
-                status, details = push_result, None
-
-            if status == "PUSHED":
-                return "PUSHED"
-            if status == "REJECTED":
-                # Single INFO log here with the rejection details (push_nzb logged details at DEBUG)
-                self._info("⛔ PUSH REJECTED: %s", details)
-                return "REJECTED"
-
-            # If push returned ERROR/UNKNOWN_RESPONSE, still report that the movie was added.
-            log.info("Movie added but push returned %s; returning ADDED", status)
-            return "ADDED"
-
-        # Ensure monitored
-        try:
-            if not movie.get("monitored"):
-                log.info("'%s' is unmonitored. Fixing...", movie.get("title", "unknown"))
-                movie["monitored"] = True
-                try:
-                    if hasattr(self.api, "upd_movie"):
-                        self.api.upd_movie(movie)
-                    elif hasattr(self.api, "update_movie"):
-                        self.api.update_movie(movie)
-                    elif hasattr(self.api, "updateMovie"):
-                        self.api.updateMovie(movie)
-                    else:
-                        log.warning("No known update method on RadarrAPI client to set monitored flag.")
-                except Exception:
-                    log.warning("Failed to update monitor status via API", exc_info=True)
-        except Exception:
-            log.warning("Failed to update monitor status for %s", movie.get("title", imdb_id), exc_info=True)
-
-        # Quality evaluation and upgrade decision
-        try:
-            if movie.get("hasFile"):
-                files: Optional[List[Dict]] = None
-                try:
-                    if hasattr(self.api, "get_movie_files_by_movie_id"):
-                        files = self.api.get_movie_files_by_movie_id(movie["id"])
-                    elif hasattr(self.api, "get_movie_files"):
-                        files = self.api.get_movie_files(movie["id"])
-                    elif hasattr(self.api, "get_files"):
-                        files = self.api.get_files(movie["id"])
-                except Exception:
-                    log.debug("Fetching movie files failed, will attempt push", exc_info=True)
-                    files = None
-
-                if files:
-                    file_entry = files[0]
-                    current_q = self._safe_get_quality_id(file_entry)
-                    # If current quality is None treat as 0
-                    current_q_val = int(current_q) if current_q is not None else 0
-                    # If current quality meets or exceeds threshold, skip
-                    if current_q_val >= int(self.threshold):
-                        self._info("ℹ️ QUALITY MET: current %s >= threshold %s", current_q_val, self.threshold)
-                        return "QUALITY_MET"
-                    # If RSS release is better than current and below threshold, attempt push
-                    self._info("⬆️ Upgrade needed: Current %s < Threshold %s; attempting push", current_q_val, self.threshold)
-                else:
-                    self._info("🆕 Missing file for '%s'. Pushing...", movie.get("title", "unknown"))
-            else:
-                self._info("🆕 Missing file for '%s'. Pushing...", movie.get("title", "unknown"))
-        except Exception:
-            log.exception("Error while evaluating current quality; proceeding to push attempt.")
-
-        # Push release
-        push_result = self.push_nzb(title, nzb_url, publish_date)
-
-        # Normalize push_result to (status, details)
-        if isinstance(push_result, tuple):
-            status, details = push_result
-        else:
-            status, details = push_result, None
-
-        # If push rejected (often due to custom formats), attempt fallback add/search
-        if status == "REJECTED":
-            try:
-                # Single INFO log here with the rejection details (push_nzb logged details at DEBUG)
-                self._info("⛔ PUSH REJECTED: %s", details)
-                log.debug("Inspecting rejection for %s (%s)...", title, imdb_id)
-
-                # Re-fetch authoritative movie record to see if it has a file now
-                movie_after = None
-                try:
-                    movie_after = self._lookup_movie(imdb_id, title=title)
-                    if movie_after and movie_after.get("id") and hasattr(self.api, "get_movie"):
-                        try:
-                            full = self.api.get_movie(movie_after["id"])
-                            if full:
-                                movie_after = full
+                                res = method(title=title, download_url=download_url, publish_date=publish_date,
+                                             imdbId=imdb_id, tmdbId=tmdb_id)
+                            except TypeError:
+                                res = method(title, download_url)
+                            log.debug("Radarr client push method %s returned: %s", method_name, res)
+                            # Normalize response below
+                            break
                         except Exception:
-                            pass
-                except Exception:
-                    movie_after = None
+                            log.debug("Radarr client push method %s failed", method_name, exc_info=True)
 
-                # If movie exists and hasFile True, the rejection likely means existing file meets cutoff.
-                if movie_after and movie_after.get("hasFile"):
-                    # Normalize details into a single lowercase string for robust substring checks
-                    reason_text = ""
-                    try:
-                        if details:
-                            if isinstance(details, (list, tuple)):
-                                reason_text = " ".join(str(x) for x in details)
-                            else:
-                                reason_text = str(details)
-                        reason_lc = reason_text.lower()
-                    except Exception:
-                        reason_lc = ""
-
-                    # Common phrases that indicate the rejection already explains "existing file" reasons
-                    existing_phrases = [
-                        "existing file meets cutoff",
-                        "existing file on disk",
-                        "existing file",
-                        "meets cutoff",
-                        "equal or higher",
-                        "custom format",
-                        "custom formats"
-                    ]
-
-                    # Try to fetch the existing file's score and include it in the log
-                    existing_score = None
-                    try:
-                        existing_score = self._get_existing_file_score(movie_after.get("id"))
-                    except Exception:
-                        existing_score = None
-
-                    # If any phrase appears in the rejection details, keep the inspection message quiet (DEBUG).
-                    if any(p in reason_lc for p in existing_phrases):
-                        log.debug(
-                            "Existing file present for %s (id=%s); skipping fallback add/search. Reason: %s; existing_score=%s",
-                            title, movie_after.get("id"), reason_text, existing_score
-                        )
-                    else:
-                        # Otherwise log at INFO so operators still see the reason
-                        self._info(
-                            "Existing file present for %s (id=%s); skipping fallback add/search. Reason: %s; existing_score=%s",
-                            title, movie_after.get("id"), reason_text, existing_score
-                        )
-                    return "QUALITY_MET"
-
-                # Otherwise, attempt fallback add/search (only when movie missing or no file)
-                self._info("Attempting fallback: add/search movie in Radarr for %s (%s).", title, imdb_id)
-                added_ok = self._ensure_movie_in_radarr(imdb_id, title=title, force_search=True)
-                if added_ok:
-                    self._info("Fallback add/search triggered for %s (%s).", title, imdb_id)
-                    return "ADDED"
+            # Ensure movie exists in Radarr and obtain movieId when possible
+            movie_id = None
+            local = self._movie_exists_locally(imdb_id=imdb_id, tmdb_id=tmdb_id)
+            if local and local.get("id"):
+                movie_id = int(local.get("id"))
+                log.debug("Found existing Radarr movie id=%s", movie_id)
+            else:
+                movie_id = self._add_movie_and_get_id(imdb_id=imdb_id, tmdb_id=tmdb_id, title=title)
+                if movie_id:
+                    log.info("Added movie to Radarr id=%s", movie_id)
                 else:
-                    log.warning("Fallback add/search failed for %s (%s).", title, imdb_id)
+                    log.debug("Could not add/find movie before push; will attempt push with tmdbId only")
+
+            # Build push payload (type-correct). Do NOT include string imdbId here.
+            payload = {
+                "title": title,
+                "downloadUrl": download_url,
+                "protocol": "usenet",
+                "publishDate": publish_date or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "releaseTitle": title
+            }
+            if tmdb_id:
+                payload["tmdbId"] = int(tmdb_id)
+            if size:
+                try:
+                    payload["size"] = int(size)
+                except Exception:
+                    pass
+            if release_group:
+                payload["releaseGroup"] = release_group
+
+            # If we have a movie_id, give Radarr a short moment to index it, then include movieId
+            if movie_id:
+                # small delay to avoid race conditions between add and push
+                time.sleep(1.5)
+                payload["movieId"] = int(movie_id)
+
+            # POST to the versioned endpoint
+            try:
+                resp = self._post("/api/v3/release/push", payload)
+            except Exception as e:
+                log.exception("Direct push to Radarr failed: %s", e)
+                return "ERROR", str(e)
+
+            # normalize response
+            try:
+                res_json = resp.json()
+            except Exception:
+                res_json = {"status_code": resp.status_code, "text": resp.text}
+
+            log.debug("Push response status=%s body=%s", resp.status_code, res_json)
+
+            # handle 405 explicitly and log Allow header
+            if resp.status_code == 405:
+                allow = resp.headers.get("Allow")
+                log.warning("Radarr push endpoint returned 405 Method Not Allowed; Allow=%s", allow)
+                return "UNKNOWN_RESPONSE", {"status_code": 405, "allow": allow, "text": resp.text}
+
+            # If Radarr returned a list (per-release), inspect first element
+            if isinstance(res_json, list) and len(res_json) > 0:
+                first = res_json[0]
+                # Approved
+                if first.get("approved"):
+                    return "PUSHED", None
+                # Rejected with rejections array
+                rejections = first.get("rejections") or []
+                if rejections:
+                    # Known case: existing equal/higher custom format score
+                    if any("Existing file on disk has a equal or higher Custom Format score" in str(r) for r in rejections):
+                        log.info("Release rejected because an equal-or-better file already exists; skipping.")
+                        return "ALREADY_HAVE_BETTER", rejections
+
+                    # If Unknown Movie, attempt targeted lookup and retry with movieId
+                    if any("Unknown Movie" in str(r) for r in rejections):
+                        log.info("Push rejected: Unknown Movie. Attempting targeted lookup and retry.")
+                        local = self._movie_exists_locally(imdb_id=imdb_id, tmdb_id=tmdb_id)
+                        if local and local.get("id"):
+                            payload["movieId"] = int(local.get("id"))
+                            log.info("Retrying push with movieId=%s", payload["movieId"])
+                            try:
+                                resp2 = self._post("/api/v3/release/push", payload)
+                                try:
+                                    res2 = resp2.json()
+                                except Exception:
+                                    res2 = {"status_code": resp2.status_code, "text": resp2.text}
+                                log.debug("Retry push response status=%s body=%s", resp2.status_code, res2)
+                                if isinstance(res2, list) and res2 and res2[0].get("approved"):
+                                    return "PUSHED", None
+                                return "REJECTED", res2
+                            except Exception:
+                                log.exception("Retry push failed", exc_info=True)
+                                return "ERROR", "retry_failed"
+                        return "REJECTED", rejections
+                    # Other rejections
+                    return "REJECTED", rejections
+
+            # If dict response with validation errors
+            if isinstance(res_json, dict):
+                if res_json.get("approved"):
+                    return "PUSHED", None
+                if res_json.get("errors") or res_json.get("rejections"):
+                    return "REJECTED", res_json
+
+            return "UNKNOWN_RESPONSE", res_json
+
+        except Exception as e:
+            log.exception("Push Exception: %s", e)
+            return "ERROR", str(e)
+
+    # -------------------------
+    # High-level release processing
+    # -------------------------
+    def process_release(self, release_title: str, imdb_id: Optional[str], download_url: str,
+                        publish_date: Optional[str] = None, size: Optional[int] = None,
+                        release_group: Optional[str] = None, extra: Optional[Dict[str, Any]] = None,
+                        force_refresh: bool = False) -> str:
+        """
+        Main entry used by the RSS pipeline.
+        Steps:
+          - Resolve tmdbId (cache -> local -> radarr lookup -> tmdb API)
+          - If movie not present locally, attempt to add it (using tmdbId/imdbId)
+          - Push the release including identifiers
+
+        force_refresh: if True, skip the imdb->tmdb cache for this run.
+        Returns a status string used by the caller.
+        """
+
+        tmdb_id, src = self._resolve_tmdb_from_imdb(imdb_id, force_refresh=force_refresh) if imdb_id else (None, "no_imdb")
+        log.debug("Resolver returned tmdb_id=%s source=%s for imdb=%s", tmdb_id, src, imdb_id)
+
+        try:
+            tmdb_id, src = self._resolve_tmdb_from_imdb(imdb_id, force_refresh=force_refresh) if imdb_id else (None, "no_imdb")
+            log.debug("Resolved tmdb_id=%s source=%s for imdb=%s", tmdb_id, src, imdb_id)
+
+            # If movie exists locally, we can skip add
+            local = self._movie_exists_locally(imdb_id=imdb_id, tmdb_id=tmdb_id)
+            if not local:
+                # Try to add the movie so Radarr has a local record
+                added = self._ensure_movie_in_radarr(imdb_id=imdb_id, tmdb_id=tmdb_id, title=release_title, force_search=True, force_refresh=force_refresh)
+                if not added:
+                    log.info("Movie %s not in library and add failed", release_title)
                     return "NOT_IN_LIBRARY"
 
-            except Exception:
-                log.exception("Fallback after push rejection failed for %s (%s).", title, imdb_id)
-                return "ERROR"
+            # Attempt push
+            status, details = self.push_nzb(
+                title=release_title,
+                download_url=download_url,
+                publish_date=publish_date,
+                imdb_id=imdb_id,
+                tmdb_id=tmdb_id,
+                size=size,
+                release_group=release_group
+            )
 
-        # If pushed successfully
-        if status == "PUSHED":
-            return "PUSHED"
+            if status == "PUSHED":
+                log.info("Push approved for %s", release_title)
+                return "PUSHED"
+            if status == "ALREADY_HAVE_BETTER":
+                log.info("Push skipped for %s: already have equal or better file", release_title)
+                return "ALREADY_HAVE_BETTER"
+            if status == "REJECTED":
+                log.info("Push rejected for %s: %s", release_title, details)
+                # If rejected because movie unknown, caller may attempt fallback add/search
+                return "REJECTED"
+            if status == "UNKNOWN_RESPONSE":
+                log.warning("Unknown push response for %s: %s", release_title, details)
+                return "UNKNOWN_RESPONSE"
+            return "API_ERROR"
 
-        # Unknown or error states
-        if status == "UNKNOWN_RESPONSE":
-            return "UNKNOWN_RESPONSE"
-        if status == "ERROR":
-            return "ERROR"
-
-        return "ERROR"
-
-    def push_nzb(self, title: str, url: str, date_obj: datetime.datetime) -> Tuple[str, Optional[Any]]:
-        """
-        Push an NZB to Radarr using the client's push endpoint.
-
-        Returns a tuple: (status, details)
-          - ("PUSHED", None) on success
-          - ("REJECTED", rejection_details) when Radarr rejects the push
-          - ("UNKNOWN_RESPONSE", raw_response) for unexpected shapes
-          - ("ERROR", error_info) on exceptions
-        """
-        try:
-            res: Any = None
-            # Try common push method names
-            try:
-                res = self.api.post_release_push(
-                    title=title, download_url=url, protocol="usenet", publish_date=date_obj
-                )
-            except Exception:
-                try:
-                    res = self.api.release_push(title=title, download_url=url, protocol="usenet", publish_date=date_obj)
-                except Exception:
-                    try:
-                        res = self.api.push_release(title=title, download_url=url, protocol="usenet", publish_date=date_obj)
-                    except Exception as e:
-                        log.error("No push method available on RadarrAPI client: %s", e, exc_info=True)
-                        return ("ERROR", str(e))
-
-            # Handle list response
-            if isinstance(res, list) and len(res) > 0:
-                first = res[0]
-                if first.get("approved"):
-                    # use helper so emoji lines align with root logs
-                    self._info("✅ PUSH APPROVED: %s", title)
-                    return ("PUSHED", None)
-                else:
-                    # keep detailed rejection info at DEBUG; return structured tuple
-                    log.debug("Push rejected details: %s", first.get("rejections"))
-                    return ("REJECTED", first.get("rejections"))
-
-            # Handle dict response
-            if isinstance(res, dict):
-                if res.get("approved"):
-                    self._info("✅ PUSH APPROVED: %s", title)
-                    return ("PUSHED", None)
-                if res.get("rejections"):
-                    log.debug("Push rejected details: %s", res.get("rejections"))
-                    return ("REJECTED", res.get("rejections"))
-
-            log.debug("Unknown push response shape: %s", type(res))
-            return ("UNKNOWN_RESPONSE", res)
-        except Exception as e:
-            log.exception("Push Exception: %s", e, exc_info=True)
-            return ("ERROR", str(e))
+        except Exception:
+            log.exception("process_release failed for %s", release_title)
+            return "API_ERROR"

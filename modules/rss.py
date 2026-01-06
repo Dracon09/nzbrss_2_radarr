@@ -14,7 +14,7 @@ from modules.util import filter_title, redact_url_query
 _session = requests.Session()
 _retry_strategy = Retry(
     total=3,
-    backoff_factor=1,                # 1s, 2s, 4s backoff
+    backoff_factor=1,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET", "HEAD"]
 )
@@ -69,7 +69,6 @@ def _extract_entry_fields(itm: ET.Element):
                 continue
             lname = name.lower()
             if lname == "imdb" and value:
-                # NZBgeek provides imdb without 'tt' prefix (e.g. 17154734 or padded 00101531)
                 imdb_val = value.strip()
             if lname == "guid" and value:
                 guid_attr_val = value.strip()
@@ -86,25 +85,19 @@ def _extract_entry_fields(itm: ET.Element):
             if m:
                 imdb_val = m.group(1)
             else:
-                # fallback: look for newznab attr in raw description text
                 m2 = re.search(r'<newznab:attr\s+name=["\']imdb["\']\s+value=["\'](\d{6,9})["\']', desc, re.IGNORECASE)
                 if m2:
                     imdb_val = m2.group(1)
 
-    # Normalize imdb_val: strip leading zeros only while the value is longer than 7 digits.
-    # This fixes padded values like "00101531" -> "0101531" (so tt0101531),
-    # while preserving legitimate 8+ digit IDs that do not start with padding zeros.
+    # Normalize imdb_val: strip leading zeros while length > 7 to fix padded values
     if imdb_val and imdb_val.isdigit():
-        # Remove leading zeros while length > 7
         while len(imdb_val) > 7 and imdb_val.startswith("0"):
             imdb_val = imdb_val[1:]
 
-    # Normalize guid to a short token for dedupe: prefer last path segment if guid looks like a URL
+    # Normalize guid to a short token for dedupe
     clean_guid = None
     if guid:
         g = guid.strip()
-        # If guid is a URL, take last path segment or query id
-        # e.g. https://.../geekseek.php?guid=4eb5...  -> extract guid param
         if "/" in g:
             qmatch = re.search(r'[?&](?:id|guid)=([^&]+)', g)
             if qmatch:
@@ -123,7 +116,6 @@ def run_rss_sync(config, radarr_processor):
     added = exists = excluded = 0
 
     guid_file = os.path.join(config.config_folder, "scanned_guids.txt")
-    # Use a list to preserve insertion order; we'll keep only the last N entries
     seen_list = []
     seen_set = set()
     if os.path.exists(guid_file):
@@ -137,14 +129,12 @@ def run_rss_sync(config, radarr_processor):
         except Exception:
             logging.warning("⚠️ Could not read scanned_guids.txt, starting fresh.")
 
-    # Log how many GUIDs were loaded and show a small sample
     try:
         logging.info("   Loaded %d seen GUIDs from %s", len(seen_set), guid_file)
         if len(seen_set) > 0:
             sample = list(seen_set)[:10]
             logging.info("   Sample seen GUIDs: %s", ", ".join(sample))
     except Exception:
-        # Non-fatal logging issue should not stop processing
         logging.debug("Could not log scanned_guids sample", exc_info=True)
 
     inc_pattern, exc_pattern = compile_patterns(config)
@@ -161,13 +151,11 @@ def run_rss_sync(config, radarr_processor):
                 response = _session.get(real_url, timeout=30)
                 response.raise_for_status()
             except requests.exceptions.ConnectionError as ce:
-                # Detect DNS resolution issues specifically for clearer logging
                 cause = getattr(ce, "__cause__", None)
                 if cause and "NameResolutionError" in type(cause).__name__:
                     logging.error("❌ DNS resolution failed for feed %s (%s). Check DNS, VPN, proxy, or hosts file.", feed.name, clean_log_url)
                 else:
                     logging.error("❌ Connection error fetching feed %s: %s", feed.name, ce)
-                # continue to next feed without traceback noise
                 continue
             except requests.exceptions.RequestException as rexc:
                 logging.error("❌ Error fetching feed %s: %s", feed.name, rexc)
@@ -180,24 +168,19 @@ def run_rss_sync(config, radarr_processor):
             feed_new_count_before = len(new_guids)
 
             for itm in items:
-                # Extract fields defensively (works for NZBFinder and NZBgeek)
                 title, nzb_url, rss_date, clean_guid, imdb_digits = _extract_entry_fields(itm)
 
-                # Already seen
                 if clean_guid in seen_set:
                     logging.debug("   [Seen] %s (guid=%s)", title or "unknown", clean_guid)
                     continue
 
-                # Title filter
                 if not filter_title(title, inc_pattern, exc_pattern):
-                    # Log excluded items at INFO for visibility
                     logging.info("   ❌ NOT MATCHED: %s", title or "unknown")
                     excluded += 1
                     new_guids.append(clean_guid)
                     seen_set.add(clean_guid)
                     continue
 
-                # If we couldn't find an NZB URL, skip
                 if not nzb_url:
                     logging.debug("   Skipping entry without NZB URL: %s (guid=%s)", title or "unknown", clean_guid)
                     new_guids.append(clean_guid)
@@ -205,16 +188,13 @@ def run_rss_sync(config, radarr_processor):
                     excluded += 1
                     continue
 
-                # Normalize IMDb id (add 'tt' prefix if digits found)
                 imdb_id = None
                 if imdb_digits:
                     imdb_digits = imdb_digits.strip()
-                    # Some feeds include leading 'tt' accidentally; strip it
                     imdb_digits = imdb_digits[2:] if imdb_digits.startswith("tt") else imdb_digits
                     if imdb_digits.isdigit():
                         imdb_id = f"tt{imdb_digits}"
 
-                # If no imdb in attrs, try to extract from title as a fallback (existing helper or regex)
                 if not imdb_id and title:
                     m = re.search(r'(tt\d{6,9}|\d{6,9})', title)
                     if m:
@@ -223,21 +203,17 @@ def run_rss_sync(config, radarr_processor):
                         if candidate.isdigit():
                             imdb_id = f"tt{candidate}"
 
-                # Log match when we have title + imdb
                 if imdb_id and title:
                     logging.info("   ✅ MATCHED (IMDb): %s (%s)", title, imdb_id)
                 else:
                     logging.info("   ❌ NOT MATCHED: %s (missing imdb or title)", title or "unknown title")
-                    # mark seen so we don't retry forever
                     new_guids.append(clean_guid)
                     seen_set.add(clean_guid)
                     excluded += 1
                     continue
 
-                # Process the movie with Radarr
                 result = radarr_processor.process_release(title, imdb_id, nzb_url, rss_date)
 
-                # Log result per item
                 if result == "PUSHED":
                     logging.info("   ✅ PUSHED: %s (%s)", title, imdb_id)
                     added += 1
@@ -252,7 +228,6 @@ def run_rss_sync(config, radarr_processor):
                     excluded += 1
                 elif result == "API_ERROR":
                     logging.warning("   ⚠️ API ERROR: %s (%s) — will retry later", title, imdb_id)
-                    # Do not mark as seen so we retry next time
                     continue
                 elif result == "REJECTED":
                     logging.info("   ⛔ PUSH REJECTED: %s (%s)", title, imdb_id)
@@ -261,26 +236,20 @@ def run_rss_sync(config, radarr_processor):
                 else:
                     logging.warning("   ❗ Unexpected result '%s' for %s (%s)", result, title, imdb_id)
 
-                # Mark as seen so we don't process again
                 new_guids.append(clean_guid)
                 seen_set.add(clean_guid)
 
-            # Log how many new GUIDs were discovered for this feed in this run
             feed_new = len(new_guids) - feed_new_count_before
             logging.info("   Feed %s: new GUIDs this run: %d", feed.name, feed_new)
 
         except Exception as e:
-            # Catch-all for unexpected parsing errors per-feed; log and continue
             logging.error("❌ Error processing feed %s: %s", feed.name, e, exc_info=True)
 
-    # Persist GUIDs preserving order and keeping only the last N
     if new_guids:
-        # Append new_guids to the end of seen_list while avoiding duplicates
         for g in new_guids:
             if g not in seen_list:
                 seen_list.append(g)
 
-        # Keep only the last N entries
         final_list = seen_list[-config.max_stored_guids:]
 
         logging.info("   Persisting %d GUIDs to %s (keeping last %d)", len(final_list), guid_file, config.max_stored_guids)
