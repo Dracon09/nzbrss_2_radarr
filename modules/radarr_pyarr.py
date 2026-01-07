@@ -2,6 +2,7 @@
 import logging
 import time
 import json
+import re
 from typing import Optional, Tuple, Any, Dict
 from urllib.parse import urljoin
 
@@ -543,7 +544,39 @@ class RadarrProcessor:
                 if rejections:
                     # Known case: existing equal/higher custom format score
                     if any("Existing file on disk has a equal or higher Custom Format score" in str(r) for r in rejections):
-                        log.info("Release rejected because an equal-or-better file already exists; skipping.")
+                        # Try to extract pushed score and quality weight from the response (first element)
+                        pushed_score = None
+                        pushed_quality_weight = None
+                        try:
+                            pushed_score = first.get("customFormatScore")
+                            pushed_quality_weight = first.get("qualityWeight")
+                        except Exception:
+                            pushed_score = None
+                            pushed_quality_weight = None
+
+                        # Try to parse an existing/current score from the rejection messages (best-effort)
+                        existing_score = None
+                        for r in rejections:
+                            try:
+                                text = str(r)
+                                # look for patterns like "score 2" or "Custom Format score 2"
+                                m = re.search(r"score\s*[:=]?\s*(\d+)", text, re.IGNORECASE)
+                                if not m:
+                                    m = re.search(r"(\d+)\s*(?:points|score)", text, re.IGNORECASE)
+                                if m:
+                                    existing_score = int(m.group(1))
+                                    break
+                            except Exception:
+                                continue
+
+                        # Log a clear informational message with both scores
+                        log.info(
+                            "Release rejected: existing equal-or-better file; existing_score=%s pushed_score=%s pushed_quality_weight=%s; rejections=%s",
+                            existing_score,
+                            pushed_score,
+                            pushed_quality_weight,
+                            rejections
+                        )
                         return "ALREADY_HAVE_BETTER", rejections
 
                     # If Unknown Movie, attempt targeted lookup and retry with movieId
@@ -632,6 +665,7 @@ class RadarrProcessor:
                 log.info("Push approved for %s", release_title)
                 return "PUSHED"
             if status == "ALREADY_HAVE_BETTER":
+                # Treat equal-or-better as informational rather than unexpected
                 log.info("Push skipped for %s: already have equal or better file", release_title)
                 return "ALREADY_HAVE_BETTER"
             if status == "REJECTED":

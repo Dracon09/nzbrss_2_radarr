@@ -48,6 +48,10 @@ rss_feeds:
     url: "https://nzbfinder.ws/rss/category?id=2040&dl=1&num=50&api_token=${NZBFINDER_API_KEY}"
   - name: "NZBgeek"
     url: "https://api.nzbgeek.info/rss?t=2040&limit=100&dl=1&r=${NZBGEEK_API_KEY}"
+  - name: "ScenenZBS"
+    url: "https://scenenzbs.com/rss?t=2000&dl=1&i=45734&r=${SCENENZBS_API_KEY}"
+  - name: "NZBplanet"
+    url: "https://nzbplanet.net/rss/?t=2040&dl=1&i=607629&&num=50&r=${NZBPLANET_API_KEY}"
 
 
 log_retention_days: 7  # default to 7 days
